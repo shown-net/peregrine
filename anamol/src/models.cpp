@@ -47,7 +47,8 @@ unsigned resp_cycle(
   if (instr.is_load) {
     /* Improve on the in-order cache simulation's memory model
        for load instructions. */
-    assert(instr.read_address != 0);  // load addresses must have a read address
+    if (instr.read_address == 0)
+      return req_cycle + instr.exe_latency;
     uint64_t cache_line = instr.read_address / CACHE_LINE_SIZE;
     auto it = last_req_cycles.find(cache_line);
     if (it == last_req_cycles.end()) {

@@ -5,6 +5,7 @@
 
 #include <string>
 #include <vector>
+#include <functional>
 
 #include "instr.h"
 
@@ -22,6 +23,12 @@ std::vector<Instr> convert_trace(
 
 // Complete pipeline: CSV → Instr
 std::vector<Instr> parse_and_convert(const std::string& csv_path);
+
+using RegionConsumer = std::function<void(std::vector<Instr>&& region)>;
+
+void stream_proto_region(
+    const std::string& proto_path,
+    const RegionConsumer& consume);
 
 }  // namespace analytical
 

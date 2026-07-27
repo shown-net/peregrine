@@ -1,0 +1,20 @@
+collection:
+  seed: 12345
+  configs_per_region: 16
+
+analysis:
+  window_size: 400
+
+labels:
+  metric_set: gem5_surrogate_core
+
+training:
+  max_epochs: 200
+  batch_size: 512
+  hidden_dims: [256, 128]
+  paper_test_fraction: 0.25
+  seed: 42
+  learning_rate: 0.001
+  num_threads: 24
+  weight_decay: 0.0
+  early_stopping_patience: 10

@@ -1,10 +1,13 @@
 #include <getopt.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -13,6 +16,7 @@
 #include "models.h"
 #include "npy_reader.h"
 #include "parser.h"
+#include "resource_registry.h"
 
 static void print_usage(const char* prog) {
   std::cout << "Usage: " << prog
@@ -71,6 +75,111 @@ static std::map<std::string, uint16_t> parse_config_json(
   return config;
 }
 
+static std::vector<std::map<std::string, uint16_t>> read_configs_stdin() {
+  std::vector<std::map<std::string, uint16_t>> configs;
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+    configs.push_back(parse_config_json(line));
+  }
+  if (configs.empty())
+    throw std::runtime_error("stdin contains no configurations");
+  return configs;
+}
+
+static std::vector<double> cdf_summary(std::vector<double> values) {
+  if (values.empty()) values.push_back(0.0);
+  std::sort(values.begin(), values.end());
+  auto percentile = [&](double point) {
+    const double rank = (values.size() - 1) * point;
+    const size_t lower = static_cast<size_t>(std::floor(rank));
+    const size_t upper = static_cast<size_t>(std::ceil(rank));
+    return values[lower] + (rank - lower) * (values[upper] - values[lower]);
+  };
+  std::vector<double> output;
+  output.reserve(101);
+  for (size_t index = 0; index < 50; ++index) {
+    const double point = (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
+    output.push_back(percentile(point));
+  }
+  double total_weight = 0.0;
+  for (double value : values) total_weight += std::max(0.0, value);
+  if (total_weight == 0.0) {
+    output.insert(output.end(), output.begin(), output.begin() + 50);
+  } else {
+    std::vector<double> cumulative;
+    std::vector<double> weighted_values;
+    double running = 0.0;
+    for (double value : values) {
+      const double weight = std::max(0.0, value);
+      if (weight == 0.0) continue;
+      running += weight / total_weight;
+      cumulative.push_back(running);
+      weighted_values.push_back(value);
+    }
+    for (size_t index = 0; index < 50; ++index) {
+      const double target = (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
+      const auto upper = std::lower_bound(cumulative.begin(), cumulative.end(), target);
+      if (upper == cumulative.begin()) {
+        output.push_back(weighted_values.front());
+      } else if (upper == cumulative.end()) {
+        output.push_back(weighted_values.back());
+      } else {
+        const size_t right = static_cast<size_t>(upper - cumulative.begin());
+        const size_t left = right - 1;
+        const double span = cumulative[right] - cumulative[left];
+        const double alpha = span == 0.0 ? 0.0 : (target - cumulative[left]) / span;
+        output.push_back(weighted_values[left] + alpha * (weighted_values[right] - weighted_values[left]));
+      }
+    }
+  }
+  const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+  output.push_back(sum / static_cast<double>(values.size()));
+  return output;
+}
+
+static std::vector<double> feature_row(
+    const std::vector<analytical::Instr>& instrs,
+    int window_size,
+    const std::map<std::string, uint16_t>& config) {
+  const auto throughputs =
+      analytical::get_throughput_single_config(instrs, window_size, config);
+  std::vector<double> row;
+  for (const auto& entry : analytical::RESOURCE_REGISTRY) {
+    if (!entry.enabled) continue;
+    const auto& values = throughputs[static_cast<size_t>(entry.resource)];
+    std::vector<double> samples;
+    if (!values.empty()) samples = values.front().data;
+    const auto summary = cdf_summary(std::move(samples));
+    row.insert(row.end(), summary.begin(), summary.end());
+  }
+  return row;
+}
+
+static void write_region_rows(
+    const std::vector<analytical::Instr>& instrs,
+    int window_size,
+    const std::vector<std::map<std::string, uint16_t>>& configs) {
+  static_assert(std::endian::native == std::endian::little,
+                "Anamol feature stream requires little-endian host");
+  for (const auto& config : configs) {
+    const auto row = feature_row(instrs, window_size, config);
+    std::cout.write(reinterpret_cast<const char*>(row.data()),
+                    static_cast<std::streamsize>(row.size() * sizeof(double)));
+  }
+  if (!std::cout)
+    throw std::runtime_error("cannot write Anamol feature stream");
+}
+
+static void write_trace_region(size_t instruction_count) {
+  static_assert(std::endian::native == std::endian::little,
+                "Anamol validation stream requires little-endian host");
+  const uint64_t value = instruction_count;
+  std::cout.write(reinterpret_cast<const char*>(&value), sizeof(value));
+  if (!std::cout)
+    throw std::runtime_error("cannot write Anamol validation stream");
+}
+
 // Return the filename stem (no directory, no extension) of a path.
 // e.g. "traces/collatz_trace_with_latency.csv" -> "collatz_trace_with_latency"
 static std::string stem_of(const std::string& path) {
@@ -90,12 +199,15 @@ static std::string zero_pad(size_t n, int width) {
 
 int main(int argc, char* argv[]) {
   std::string csv_file = "trace.csv";
+  std::string proto_file;
   int window_size = 400;
   std::string output_dir;       // empty = auto-derive from csv_file
   std::string latencies_npy;    // empty = single-run mode
   std::string config_json;      // empty = full sweep (default)
+  bool configs_stdin = false;
+  bool validate_trace = false;
 
-  const char* short_opts = "hw:t:o:l:c:";
+  const char* short_opts = "hw:t:o:l:c:p:sv";
   const option long_opts[] = {
       {"help",          no_argument,       nullptr, 'h'},
       {"window",        required_argument, nullptr, 'w'},
@@ -103,6 +215,9 @@ int main(int argc, char* argv[]) {
       {"output-dir",    required_argument, nullptr, 'o'},
       {"latencies-npy", required_argument, nullptr, 'l'},
       {"config-json",   required_argument, nullptr, 'c'},
+      {"trace-proto",   required_argument, nullptr, 'p'},
+      {"configs-stdin", no_argument,       nullptr, 's'},
+      {"validate-trace", no_argument,      nullptr, 'v'},
       {nullptr, 0, nullptr, 0},
   };
 
@@ -129,10 +244,44 @@ int main(int argc, char* argv[]) {
       case 'c':
         config_json = optarg;
         break;
+      case 'p':
+        proto_file = optarg;
+        break;
+      case 's':
+        configs_stdin = true;
+        break;
+      case 'v':
+        validate_trace = true;
+        break;
       case '?':
       default:
         print_usage(argv[0]);
         return 1;
+    }
+  }
+
+  if (!proto_file.empty()) {
+    try {
+      if (validate_trace == configs_stdin)
+        throw std::runtime_error("protobuf mode requires exactly one of --validate-trace or --configs-stdin");
+      if (validate_trace) {
+        analytical::stream_proto_region(
+            proto_file,
+            [](std::vector<analytical::Instr>&& region) {
+              write_trace_region(region.size());
+            });
+      } else {
+        const auto configs = read_configs_stdin();
+        analytical::stream_proto_region(
+            proto_file,
+            [&](std::vector<analytical::Instr>&& region) {
+              write_region_rows(region, window_size, configs);
+            });
+      }
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "Anamol error: " << e.what() << "\n";
+      return 1;
     }
   }
 

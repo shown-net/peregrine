@@ -5,7 +5,6 @@
 #include "instr.h"
 #include "models.h"
 #include "parser.h"
-#include "resources.h"
 
 static const char* resource_name(analytical::Resource res) {
   using analytical::Resource;

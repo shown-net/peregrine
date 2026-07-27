@@ -1,306 +1,219 @@
-import argparse
-import json
-import os
-import time
+from __future__ import annotations
+
+import copy
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-import joblib
 
-from model import PeregrineMLModel
-
-# XLA imports
-import torch_xla.core.xla_model as xm
-import torch_xla
+from anamol.python.design_space import PeregrineConfig
+from .dataset_io import read_dataset_shards
+from .inference import IDENTITY_COLUMNS
+from .model import MultiHeadPeregrineModel
 
 
-def load_dataset(dataset_path: str) -> pd.DataFrame:
-    return pd.read_csv(dataset_path)
-
-
-def train_epoch(model: nn.Module, loader: DataLoader, loss_fn: nn.Module, optimizer: optim.Optimizer, device: str) -> float:
-    model.train()
-    total_loss = 0.0
-    num_batches = 0
-    for inputs, targets in loader:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = loss_fn(outputs, targets)
-        loss.backward()
-        optimizer.step()
-        torch_xla.sync()
-        total_loss += loss.item()
-        num_batches += 1
-    return total_loss / max(num_batches, 1)
-
-
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: str) -> tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_percent_error = 0.0
-    num_batches = 0
-
-    with torch.no_grad():
-        for inputs, targets in loader:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            torch_xla.sync()
-            total_loss += loss.item()
-            # Compute mean absolute percent error for this batch.
-            # Add small epsilon to denominator to avoid division by zero.
-            eps = 1e-8
-            batch_percent_error = (
-                (torch.abs(outputs - targets) / (torch.abs(targets) + eps)).mean() * 100.0
-            )
-            total_percent_error += batch_percent_error.item()
-            num_batches += 1
-
-    denom = max(num_batches, 1)
-    avg_loss = total_loss / denom
-    avg_percent_error = total_percent_error / denom
-    return float(avg_loss), float(avg_percent_error)
-
-
-def write_predictions_csv(
-    output_dir: str,
-    suffix: str,
-    test_features: pd.DataFrame,
-    test_labels: pd.Series,
-    original_test_dataset: pd.DataFrame,
-    model: nn.Module,
-    device: str,
-) -> tuple[float, float]:
-    features = test_features.copy().astype(float)
-
-    benchmark_values = original_test_dataset["benchmark"].to_numpy(copy=True)
-    checkpoint_values = original_test_dataset["checkpoint"].to_numpy(copy=True)
-    fast_forward_values = original_test_dataset["fast_forward"].to_numpy(copy=True)
-
-    start_time = time.perf_counter()
-    model.eval()
-    with torch.no_grad():
-        inputs = torch.from_numpy(features.to_numpy(copy=True)).float().to(device)
-        predictions = model(inputs).detach().cpu().squeeze(1).numpy()
-        torch_xla.sync()
-    duration = time.perf_counter() - start_time
-
-    predictions_df = pd.DataFrame(
-        {
-            "benchmark": benchmark_values,
-            "checkpoint": checkpoint_values,
-            "fast_forward": fast_forward_values,
-            "actual_cpi": test_labels.to_numpy(copy=True),
-            "predicted_cpi": predictions,
-        }
+def train_surrogate(
+    *, config: PeregrineConfig, dataset_dir: str | Path, output_dir: str | Path,
+    workload_ids: tuple[str, ...] | None = None,
+    feature_columns: tuple[str, ...] | None = None,
+    label_columns: tuple[str, ...] | None = None,
+    output_metrics: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    features = feature_columns or tuple(config.feature_columns)
+    labels = label_columns or tuple(config.label_columns)
+    metrics = output_metrics or tuple(label.removeprefix("label_") for label in labels)
+    if len(metrics) != len(labels):
+        raise ValueError("output metrics must match label columns")
+    frame = read_dataset_shards(
+        dataset_dir, columns=[*IDENTITY_COLUMNS, *features, *labels]
     )
-    predictions_path = os.path.join(output_dir, f"{suffix}_predictions.csv")
-    predictions_df.to_csv(predictions_path, index=False)
-
-    eps = 1e-8
-    percent_error = float(
-        (
-            (predictions_df["predicted_cpi"] - predictions_df["actual_cpi"]).abs()
-            / (predictions_df["actual_cpi"].abs() + eps)
-        ).mean()
-        * 100.0
+    if workload_ids is not None:
+        frame = frame[frame.workload_id.isin(workload_ids)].copy()
+    _validate(frame, features, labels)
+    if config.training.num_threads is not None:
+        torch.set_num_threads(config.training.num_threads)
+    x = frame.loc[:, features].to_numpy(dtype=np.float32)
+    y = frame.loc[:, labels].to_numpy(dtype=np.float32)
+    split = _split(len(frame), config.training.seed, config.training.paper_test_fraction)
+    model, x_mean, x_scale, y_mean, y_scale, epochs = _fit(
+        config, x[split.train], y[split.train], x[split.test], y[split.test], config.training.seed, labels
     )
-    return duration, percent_error
+    test_prediction = _predict(model, x[split.test], x_mean, x_scale, y_mean, y_scale)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoint = output / "checkpoint.pt"
+    torch.save({
+        "state_dict": model.state_dict(), "feature_columns": features,
+        "label_columns": labels, "output_metrics": metrics,
+        "hidden_dims": tuple(config.training.hidden_dims),
+        "num_threads": int(torch.get_num_threads()),
+        "feature_mean": torch.from_numpy(x_mean),
+        "feature_scale": torch.from_numpy(x_scale),
+        "label_mean": torch.from_numpy(y_mean),
+        "label_scale": torch.from_numpy(y_scale),
+    }, checkpoint)
+    return {
+        "checkpoint": str(checkpoint),
+        "random_split": {
+            "seed": config.training.seed, "train_rows": int(split.train.sum()),
+            "test_rows": int(split.test.sum()), "epochs": epochs,
+            **_error_metrics(labels, y[split.test], test_prediction),
+        },
+    }
 
 
-def pre_process_features(features: pd.DataFrame) -> pd.DataFrame:
-    # Drop metric columns (Y in the X -> Y regression problem)
-    features = features.drop(columns=["cpi"])
-
-    # Drop columns encoding program region
-    features = features.drop(columns=["benchmark", "checkpoint", "fast_forward"])
-
-    # Split stride_prefetch into 1-hot encoded columns
-    stride_prefetch_dummies = pd.get_dummies(features["stride_prefetcher_degree"], prefix="stride_prefetcher_degree")
-    features = features.drop(columns=["stride_prefetcher_degree"])
-    features = pd.concat([features, stride_prefetch_dummies], axis=1)
-
-    # Drop branch_predictor (captured by misprediction rate column)
-    features = features.drop(columns=["branch_predictor"])
-
-    memsize_colummns = ["l1d_size", "l1i_size", "l2_size"]
-    for col in memsize_colummns:
-        features[col] = features[col].apply(lambda x: 
-            int(x.replace("KiB", "")) * 1024 if "KiB" in x 
-            else int(x.replace("MiB", "")) * 1024**2 if "MiB" in x 
-            else int(x))
-
-    # Reciprocal values for queue sizes
-    queue_size_columns = ["lq_entries", "sq_entries", "rob_size"]
-    for col in queue_size_columns:
-        reciprocal_col_name = f"reciprocal_{col}"
-        features[reciprocal_col_name] = 1.0 / features[col]
-
-    return features
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the Peregrine ML model using PyTorch and XLA with the AWS Neuron SDK.")
-    parser.add_argument(
-        "-d",
-        "--dataset-path",
-        help="Path to the Peregrine dataset csv file",
+def evaluate_workload_ood(
+    *, config: PeregrineConfig, dataset_dir: str | Path,
+    workload_ids: tuple[str, ...] | None = None,
+    feature_columns: tuple[str, ...] | None = None,
+    label_columns: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    features = feature_columns or tuple(config.feature_columns)
+    labels = label_columns or tuple(config.label_columns)
+    frame = read_dataset_shards(
+        dataset_dir, columns=[*IDENTITY_COLUMNS, *features, *labels]
     )
-    parser.add_argument(
-        "--test-size",
-        default=0.25,
-        type=float,
-        help="Fraction of the dataset to use for testing"
-    )
-    parser.add_argument(
-        "-o",
-        "--output-dir",
-        help="Output directory for checkpoint and metrics files",
-        default="training_results",
-    )
-    parser.add_argument(
-        "--add-test-predictions",
-        action="store_true",
-        help="Write a CSV with actual/predicted CPI plus benchmark, checkpoint, and fast_forward for the test dataset.",
-    )
-
-    args = parser.parse_args()
-
-    return args
+    if workload_ids is not None:
+        frame = frame[frame.workload_id.isin(workload_ids)].copy()
+    _validate(frame, features, labels)
+    if config.training.num_threads is not None:
+        torch.set_num_threads(config.training.num_threads)
+    x = frame.loc[:, features].to_numpy(dtype=np.float32)
+    y = frame.loc[:, labels].to_numpy(dtype=np.float32)
+    return {
+        "workload_ood": _workload_ood(config, frame, x, y, labels),
+    }
 
 
-def main() -> None:
-    args = parse_args()
+class _Split:
+    def __init__(self, train: np.ndarray, test: np.ndarray) -> None:
+        self.train, self.test = train, test
 
-    print(f"Loading dataset from {args.dataset_path}")
-    dataset = load_dataset(args.dataset_path)
-    print(f'Dataset size: {dataset.shape[0]}')
-    print(f"Using train/test split with test size {args.test_size}")
-    train_dataset, test_dataset = train_test_split(dataset, test_size=args.test_size, random_state=42)
 
-    print(f"Final split: {len(train_dataset)} train, {len(test_dataset)} test ({len(test_dataset)/(len(train_dataset)+len(test_dataset)):.2%} test)")
-    print(f"Train dataset shape: {train_dataset.shape}")
-    print(f"Test dataset shape: {test_dataset.shape}")
+def _split(rows: int, seed: int, test_fraction: float) -> _Split:
+    order = np.random.default_rng(seed).permutation(rows)
+    test_rows = max(1, int(round(rows * test_fraction)))
+    test = np.zeros(rows, dtype=bool)
+    test[order[:test_rows]] = True
+    return _Split(~test, test)
 
-    train_features = pre_process_features(train_dataset)
-    test_features = pre_process_features(test_dataset)
 
-    # Standardize all features (program + config) with a shared StandardScaler
-    scaler = StandardScaler()
-    train_features = train_features.copy().astype(float)
-    test_features = test_features.copy().astype(float)
-    train_features[train_features.columns] = scaler.fit_transform(train_features[train_features.columns])
-    test_features[train_features.columns] = scaler.transform(test_features[train_features.columns])
-
-    train_labels = train_dataset["cpi"]
-    test_labels = test_dataset["cpi"]
-
-    train_features_t = torch.from_numpy(train_features.to_numpy(copy=True)).float()
-    train_labels_t = torch.from_numpy(train_labels.to_numpy(copy=True)).float().unsqueeze(1)
-    test_features_t = torch.from_numpy(test_features.to_numpy(copy=True)).float()
-    test_labels_t = torch.from_numpy(test_labels.to_numpy(copy=True)).float().unsqueeze(1)
-
-    train_ds = TensorDataset(train_features_t, train_labels_t)
-    test_ds = TensorDataset(test_features_t, test_labels_t)
-
-    train_loader = DataLoader(train_ds, batch_size=512, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=512, shuffle=False)
-
-    device = "xla"
-    epochs = 200
-    model = PeregrineMLModel(input_size=train_features.shape[1], hidden_dims=[256, 128], output_size=1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001) #, weight_decay=0.3)
-    # scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[5000, 6000, 7000, 8000], gamma=0.5)
-    loss_fn = nn.L1Loss()
-
-    early_stop_patience = 10
-    best_eval_loss = float("inf")
-    epochs_without_improvement = 0
-
-    print('----------- Start Training --------------')
-    epochs_data: list[dict[str, float]] = []
-    total_start = time.perf_counter()
-    for epoch in range(1, epochs + 1):
-        epoch_start = time.perf_counter()
-        train_loss = train_epoch(model, train_loader, loss_fn, optimizer, device)
-        eval_loss, percent_error = evaluate(model, test_loader, loss_fn, device)
-        epoch_duration = time.perf_counter() - epoch_start
-        epochs_data.append(
-            {
-                "duration": epoch_duration,
-                "train_loss": float(train_loss),
-                "eval_loss": float(eval_loss),
-                "percent_error": float(percent_error),
-            }
-        )
-        print(
-            f"Epoch {epoch:02d} | "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Eval Loss: {eval_loss:.4f} | "
-            f"Percent Error: {percent_error:.2f}% | "
-            f"Time: {epoch_duration:.2f}s"
-        )
-
-        if eval_loss < best_eval_loss:
-            best_eval_loss = eval_loss
-            epochs_without_improvement = 0
+def _fit(config: PeregrineConfig, train_x: np.ndarray, train_y: np.ndarray,
+         validation_x: np.ndarray, validation_y: np.ndarray, seed: int,
+         label_columns: tuple[str, ...]):
+    x_mean, x_scale = _standardize(train_x)
+    y_mean, y_scale = _standardize(train_y)
+    train = TensorDataset(torch.from_numpy(_scale(train_x, x_mean, x_scale)), torch.from_numpy(_scale(train_y, y_mean, y_scale)))
+    loader = DataLoader(train, batch_size=config.training.batch_size, shuffle=True)
+    torch.manual_seed(seed)
+    model = MultiHeadPeregrineModel(train_x.shape[1], config.training.hidden_dims, label_columns)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.learning_rate, weight_decay=config.training.weight_decay)
+    validation_x_tensor = torch.from_numpy(_scale(validation_x, x_mean, x_scale))
+    validation_y_tensor = torch.from_numpy(_scale(validation_y, y_mean, y_scale))
+    best_state, best_loss, stale, best_epoch = None, float("inf"), 0, 0
+    for epoch in range(1, config.training.max_epochs + 1):
+        model.train()
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad()
+            F.l1_loss(model(batch_x), batch_y).backward()
+            optimizer.step()
+        model.eval()
+        with torch.inference_mode():
+            loss = float(F.l1_loss(model(validation_x_tensor), validation_y_tensor))
+        if loss < best_loss:
+            best_state, best_loss, stale, best_epoch = copy.deepcopy(model.state_dict()), loss, 0, epoch
         else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= early_stop_patience:
-                print(f"Early stopping: no improvement for {early_stop_patience} epochs.")
+            stale += 1
+            if stale >= config.training.early_stopping_patience:
                 break
+    assert best_state is not None
+    model.load_state_dict(best_state)
+    return model, x_mean, x_scale, y_mean, y_scale, best_epoch
 
-    print('------------ End Training ---------------')
-    total_duration = time.perf_counter() - total_start
 
-    # Create output directory if it doesn't exist
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    checkpoint_path = os.path.join(args.output_dir, f"checkpoint.pt")
-    checkpoint = {'state_dict': model.state_dict()}
-    xm.save(checkpoint, checkpoint_path)
-
-    # Persist preprocessing artifacts so inference can reproduce training transforms.
-    scaler_path = os.path.join(args.output_dir, f"scaler.joblib")
-    joblib.dump(scaler, scaler_path)
-
-    test_predictions_duration = None
-    test_predictions_percent_error = None
-
-    if args.add_test_predictions:
-        test_predictions_duration, test_predictions_percent_error = write_predictions_csv(
-            args.output_dir,
-            "test",
-            test_features,
-            test_labels,
-            test_dataset,
-            model,
-            device,
+def _workload_ood(config, frame, x, y, label_columns: tuple[str, ...]) -> tuple[dict[str, object], ...]:
+    reports = []
+    for offset, workload in enumerate(sorted(frame.workload_id.astype(str).unique())):
+        heldout = frame.workload_id.astype(str).to_numpy() == workload
+        if heldout.all() or (~heldout).sum() < 2:
+            continue
+        training = np.flatnonzero(~heldout)
+        validation = _split(len(training), config.training.seed + offset + 1, config.training.paper_test_fraction)
+        model, x_mean, x_scale, y_mean, y_scale, epochs = _fit(
+            config, x[training[validation.train]], y[training[validation.train]],
+            x[training[validation.test]], y[training[validation.test]],
+            config.training.seed + offset + 1,
+            label_columns,
         )
-        print(f"Test predictions time: {test_predictions_duration:.2f}s")
-        print(f"Test predictions percent error: {test_predictions_percent_error:.2f}%")
-
-    metrics_path = os.path.join(args.output_dir, f"metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "total_duration": total_duration,
-                "test_predictions_duration": test_predictions_duration,
-                "test_predictions_percent_error": test_predictions_percent_error,
-                "epochs": epochs_data,
-            },
-            f,
-            indent=2,
-        )
+        reports.append({
+            "heldout_workload": workload,
+            "rows": int(heldout.sum()),
+            "epochs": epochs,
+            **_error_metrics(
+                label_columns,
+                y[heldout],
+                _predict(model, x[heldout], x_mean, x_scale, y_mean, y_scale),
+            ),
+        })
+    return tuple(reports)
 
 
-if __name__ == "__main__":
-    main()
+def _standardize(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    scale = values.std(axis=0, dtype=np.float64).astype(np.float32)
+    return mean, np.maximum(scale, np.float32(1e-6))
+
+
+def _scale(values: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray((values - mean) / scale, dtype=np.float32)
+
+
+def _predict(model, x, x_mean, x_scale, y_mean, y_scale) -> np.ndarray:
+    with torch.inference_mode():
+        return (model(torch.from_numpy(_scale(x, x_mean, x_scale))).numpy() * y_scale + y_mean).astype(np.float32)
+
+
+def _error_metrics(
+    label_columns: tuple[str, ...],
+    truth: np.ndarray,
+    prediction: np.ndarray,
+) -> dict[str, dict[str, float]]:
+    absolute = np.abs(truth - prediction).astype(np.float64, copy=False)
+    denominator = np.abs(truth).sum(axis=0, dtype=np.float64)
+    smape_denominator = np.abs(truth) + np.abs(prediction)
+    smape = np.divide(
+        2.0 * absolute,
+        smape_denominator,
+        out=np.zeros_like(absolute, dtype=np.float64),
+        where=smape_denominator != 0.0,
+    ).mean(axis=0)
+    values = {
+        "mae": absolute.mean(axis=0),
+        "rmse": np.sqrt(np.square(truth - prediction, dtype=np.float64).mean(axis=0)),
+        "wape": absolute.sum(axis=0, dtype=np.float64) / denominator,
+        "smape": smape,
+    }
+    return {
+        name: {
+            label.removeprefix("label_"): float(value)
+            for label, value in zip(label_columns, metric_values, strict=True)
+        }
+        for name, metric_values in values.items()
+    }
+
+
+def _validate(frame, features, labels) -> None:
+    if frame.empty or frame.duplicated(list(IDENTITY_COLUMNS)).any():
+        raise ValueError("dataset must be non-empty with unique sample identities")
+    if not np.isfinite(frame.loc[:, [*features, *labels]].to_numpy(dtype=np.float64)).all():
+        raise ValueError("dataset contains non-finite numeric values")
+    label_values = frame.loc[:, labels].to_numpy(dtype=np.float64)
+    constant = tuple(
+        name
+        for name, spread in zip(labels, np.ptp(label_values, axis=0), strict=True)
+        if spread == 0.0
+    )
+    if constant:
+        raise ValueError(f"dataset contains zero-variance labels: {constant}")

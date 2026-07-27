@@ -1,6 +1,9 @@
 CXX := g++
 CXXFLAGS := -std=c++20 -Wall -Wextra
-INCLUDE := -I include -I src
+GEM5_ROOT ?= ../../gem5
+PROTOC ?= protoc
+INCLUDE := -I include -I src -I build/proto
+LDLIBS := -lprotobuf -lzstd
 
 # OpenMP usage: set OMP=0 to disable OpenMP (e.g., make OMP=0)
 OMP ?= 1
@@ -76,6 +79,10 @@ OBJS_MODELS_SERIAL := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/serial_%.o,$(SRCS_MO
 SRCS_PARSER := \
   $(SRC_DIR)/parser.cpp
 
+PROTO_BUILD := $(BUILD)/proto
+PROTO_SRC := $(PROTO_BUILD)/peregrine_trace.pb.cc
+PROTO_OBJ := $(OBJDIR)/proto/peregrine_trace.pb.o
+
 # ---- Executables ----
 SRCS_TEST_PARAMS := \
   $(TESTS_DIR)/test_params.cpp
@@ -91,14 +98,17 @@ SRCS_MAIN := \
   $(SRC_DIR)/models.cpp
 
 # ---- Objects ----
-OBJS_MAIN := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/%.o,$(filter $(SRC_DIR)/%,$(SRCS_MAIN)))
+OBJS_MAIN := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/%.o,$(filter $(SRC_DIR)/%,$(SRCS_MAIN))) \
+             $(PROTO_OBJ)
 
 OBJS_TEST_PARAMS := $(patsubst $(TESTS_DIR)/%.cpp,$(OBJDIR)/tests/%.o,$(SRCS_TEST_PARAMS))
 
 OBJS_TEST_MODELS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/%.o,$(filter $(SRC_DIR)/%,$(SRCS_TEST_MODELS))) \
-					$(patsubst $(TESTS_DIR)/%.cpp,$(OBJDIR)/tests/%.o,$(filter $(TESTS_DIR)/%,$(SRCS_TEST_MODELS)))
+					$(patsubst $(TESTS_DIR)/%.cpp,$(OBJDIR)/tests/%.o,$(filter $(TESTS_DIR)/%,$(SRCS_TEST_MODELS))) \
+					$(PROTO_OBJ)
 
-OBJS_PARSER := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/standalone_%.o,$(SRCS_PARSER))
+OBJS_PARSER := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/standalone_%.o,$(SRCS_PARSER)) \
+               $(PROTO_OBJ)
 
 # ---- Default ----
 all: $(BUILD)/main $(BUILD)/test_params $(BUILD)/test_models_omp $(BUILD)/test_models_noomp $(BUILD)/parser
@@ -111,11 +121,19 @@ anamol: $(BUILD)/main
 prep:
 	@mkdir -p $(BUILD) $(OBJDIR) $(OBJDIR)/tests
 
+$(PROTO_SRC): $(GEM5_ROOT)/src/proto/peregrine_trace.proto | prep
+	@mkdir -p $(PROTO_BUILD)
+	$(PROTOC) --cpp_out=$(PROTO_BUILD) -I$(GEM5_ROOT)/src/proto $<
+
 # ---- Compile rules ----
 # All objects depend on generated headers so a registry.yaml change triggers a rebuild.
-$(OBJDIR)/%.o: $(SRC_DIR)/%.cpp $(GENERATED_HEADERS) | prep
+$(OBJDIR)/%.o: $(SRC_DIR)/%.cpp $(GENERATED_HEADERS) $(PROTO_SRC) | prep
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) -c $< -o $@
+
+$(OBJDIR)/proto/%.o: $(PROTO_BUILD)/%.cc | prep
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
 
 $(OBJDIR)/tests/%.o: $(TESTS_DIR)/%.cpp $(GENERATED_HEADERS) | prep
 	@mkdir -p $(dir $@)
@@ -133,21 +151,21 @@ $(OBJDIR)/serial_%.o: $(SRC_DIR)/%.cpp $(GENERATED_HEADERS) | prep
 
 # ---- Link executables ----
 $(BUILD)/main: $(OBJS_MAIN)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ $(LDLIBS) -o $@
 
 $(BUILD)/parser: $(OBJS_PARSER)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ $(LDLIBS) -o $@
 
 $(BUILD)/test_params: $(OBJS_TEST_PARAMS)
 	$(CXX) $(CXXFLAGS) $(INCLUDE) $^ -o $@
 
 # OpenMP version (parallel)
 $(BUILD)/test_models_omp: $(OBJS_TEST_MODELS)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ $(LDLIBS) -o $@
 
 # Non-OpenMP version (serial, for benchmark)
 $(BUILD)/test_models_noomp: $(filter-out $(OBJDIR)/models.o,$(OBJS_TEST_MODELS)) $(OBJS_MODELS_SERIAL)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $^ -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDE) $^ $(LDLIBS) -o $@
 
 # Keep backward compatibility
 $(BUILD)/test_models: $(BUILD)/test_models_omp
