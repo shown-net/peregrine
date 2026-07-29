@@ -22,3 +22,7 @@ anamol/output
 *.pkl
 *.npy
 anamol/traces
+anamol/_analysis*.so
+
+# Local paper references used during reconstruction.
+docs/

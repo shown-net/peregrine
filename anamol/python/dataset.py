@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import json
 import re
 import shlex
 from pathlib import Path
@@ -23,6 +24,7 @@ from .run_config import RunConfig
 
 IDENTITY_COLUMNS = ("workload_id", "region_id", "config_id")
 TRACE_FILE = "peregrine.trace.pb.zst"
+SAMPLING_MANIFEST = "sampling_manifest.json"
 PARQUET_BATCH_ROWS = 8192
 FINAL_CONFIG_ID = re.compile(r"config_[0-9a-f]{16}$")
 
@@ -36,31 +38,32 @@ class RawSample:
     trace_path: Path
 
 
+@dataclass(frozen=True)
+class DatasetTableContext:
+    analytical_columns: tuple[str, ...]
+    categorical_values: dict[str, tuple[str, ...]]
+    reciprocal_parameters: tuple[str, ...]
+
+
 def build_dataset_shards(
     *,
     config: PeregrineConfig,
     raw_root: str | Path,
     output_dir: str | Path,
     workload_ids: tuple[str, ...] | None = None,
+    manifest_path: str | Path | None = None,
     workers: int = 24,
 ) -> dict[str, Any]:
     if workers < 1:
         raise ValueError("dataset workers must be positive")
     raw = Path(raw_root).resolve()
-    workloads_root = raw / "workloads"
-    if not workloads_root.is_dir():
-        raise ValueError(f"raw root contains no workloads: {raw}")
-    by_workload = {
-        path.name: path
-        for path in workloads_root.iterdir()
-        if path.is_dir()
-    }
-    canonical_workloads = tuple(workload_ids) if workload_ids is not None else tuple(sorted(by_workload))
+    manifest = Path(manifest_path).resolve() if manifest_path is not None else raw / SAMPLING_MANIFEST
+    samples_by_workload = _load_manifest_samples(raw, manifest_path=manifest, config=config)
+    canonical_workloads = tuple(workload_ids) if workload_ids is not None else tuple(sorted(samples_by_workload))
     if not canonical_workloads or len(set(canonical_workloads)) != len(canonical_workloads):
         raise ValueError("dataset workload selection is empty or duplicated")
-    if set(canonical_workloads) - set(by_workload):
-        raise ValueError("raw workload layout differs from the canonical roster")
-    workload_roots = tuple(by_workload[workload] for workload in canonical_workloads)
+    if set(canonical_workloads) - set(samples_by_workload):
+        raise ValueError("raw manifest differs from the canonical workload selection")
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     for partial in out.glob("*.partial"):
@@ -74,23 +77,12 @@ def build_dataset_shards(
         if stale.name not in expected_shards:
             stale.unlink()
 
-    for workload_root in workload_roots:
-        workload_id = workload_root.name
-        regions_root = workload_root / "regions"
-        if not regions_root.is_dir():
-            raise FileNotFoundError(f"missing planned region directory: {regions_root}")
-        region_ids = tuple(sorted(path.name for path in regions_root.iterdir() if path.is_dir()))
-        if not region_ids:
-            raise ValueError(f"raw dataset contains no region samples: {workload_root}")
+    for workload_id in canonical_workloads:
+        samples, skipped = _manifest_valid_samples(samples_by_workload[workload_id], config=config)
         shard = out / f"{_shard_stem(workload_id)}.parquet"
-        samples, skipped = _discover_raw_samples(
-            workload_root,
-            workload_id=workload_id,
-            config=config,
-        )
         expected_rows = tuple((item.region_id, item.config.config_id) for item in samples)
         if not expected_rows:
-            raise ValueError(f"raw dataset contains no valid samples: {workload_root}")
+            raise ValueError(f"raw dataset contains no valid samples: {workload_id}")
         if shard.exists():
             try:
                 _validate_dataset_shard(
@@ -106,7 +98,6 @@ def build_dataset_shards(
                 continue
         rows = _build_workload_dataset(
             config=config,
-            workload_root=workload_root,
             workload_id=workload_id,
             samples=samples,
             destination=shard,
@@ -124,6 +115,108 @@ def build_dataset_shards(
         "shards": sorted(expected_shards),
         "workloads": workload_reports,
     }
+
+
+def _load_manifest_samples(
+    raw_root: Path,
+    *,
+    manifest_path: Path,
+    config: PeregrineConfig,
+) -> dict[str, tuple[RawSample, ...]]:
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing CPU collection sampling manifest: {manifest_path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"sampling manifest must be a mapping: {manifest_path}")
+    if str(payload.get("trace_file")) != TRACE_FILE:
+        raise ValueError(f"sampling manifest trace file differs from dataset contract: {manifest_path}")
+    workloads = payload.get("workloads")
+    if not isinstance(workloads, list) or not workloads:
+        raise ValueError(f"sampling manifest contains no workloads: {manifest_path}")
+    by_workload: dict[str, list[RawSample]] = {}
+    for workload_node in workloads:
+        if not isinstance(workload_node, dict):
+            raise ValueError("sampling manifest workload must be a mapping")
+        workload_id = str(workload_node["workload_id"])
+        regions = workload_node.get("regions")
+        if not isinstance(regions, list) or not regions:
+            raise ValueError(f"sampling manifest contains no regions: {workload_id}")
+        for region_node in regions:
+            if not isinstance(region_node, dict):
+                raise ValueError("sampling manifest region must be a mapping")
+            region_id = str(region_node["region_id"])
+            samples = region_node.get("samples")
+            if not isinstance(samples, list) or not samples:
+                raise ValueError(f"sampling manifest contains no samples: {workload_id}/{region_id}")
+            roles = [str(sample.get("role")) for sample in samples if isinstance(sample, dict)]
+            if roles.count("trace_producer") != 1:
+                raise ValueError(f"sampling manifest region requires one trace producer: {workload_id}/{region_id}")
+            for sample_node in samples:
+                if not isinstance(sample_node, dict):
+                    raise ValueError("sampling manifest sample must be a mapping")
+                trace_path = _manifest_path(raw_root, sample_node["trace_path"])
+                stats_path = _manifest_path(raw_root, sample_node["stats_path"])
+                parameter_values = sample_node.get("parameter_values")
+                if not isinstance(parameter_values, dict):
+                    raise ValueError(f"sampling manifest sample has no parameter values: {workload_id}/{region_id}")
+                values = config.microarchitecture.parameter_values(
+                    {str(name): value for name, value in parameter_values.items()}
+                )
+                run_config = RunConfig(
+                    str(sample_node["config_id"]),
+                    values,
+                    config.microarchitecture.gem5_args(values),
+                )
+                try:
+                    labels = read_label_values(stats_path, config.labels)
+                except (OSError, KeyError, TypeError, ValueError):
+                    by_workload.setdefault(workload_id, []).append(
+                        RawSample(workload_id, region_id, run_config, (), trace_path)
+                    )
+                    continue
+                if labels.shape != (1, len(config.labels.labels)) or not np.isfinite(labels).all():
+                    by_workload.setdefault(workload_id, []).append(
+                        RawSample(workload_id, region_id, run_config, (), trace_path)
+                    )
+                    continue
+                by_workload.setdefault(workload_id, []).append(
+                    RawSample(
+                        workload_id,
+                        region_id,
+                        run_config,
+                        tuple(float(value) for value in labels[0]),
+                        trace_path,
+                    )
+                )
+    return {
+        workload_id: tuple(sorted(samples, key=lambda item: (item.region_id, item.config.config_id)))
+        for workload_id, samples in by_workload.items()
+    }
+
+
+def _manifest_path(raw_root: Path, raw_path: object) -> Path:
+    path = Path(str(raw_path))
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"sampling manifest path must be relative to raw root: {path}")
+    return raw_root / path
+
+
+def _manifest_valid_samples(
+    samples: tuple[RawSample, ...],
+    *,
+    config: PeregrineConfig,
+) -> tuple[tuple[RawSample, ...], int]:
+    valid: list[RawSample] = []
+    skipped = 0
+    for sample in samples:
+        if not sample.trace_path.is_file() or sample.trace_path.stat().st_size == 0:
+            skipped += 1
+            continue
+        if len(sample.labels) != len(config.labels.labels) or not np.isfinite(np.asarray(sample.labels, dtype=np.float64)).all():
+            skipped += 1
+            continue
+        valid.append(sample)
+    return tuple(valid), skipped
 
 
 def _discover_raw_samples(
@@ -213,7 +306,7 @@ def _run_config_from_log(sample_root: Path, config: PeregrineConfig) -> RunConfi
     except (OSError, StopIteration) as error:
         raise ValueError(f"missing gem5 command line for raw sample: {sample_root}") from error
     parameter_flags = {
-        config.microarchitecture.parameters_by_name[name].gem5_arg
+        config.microarchitecture.parameters_by_name[name].gem5_flag
         for name in config.design_parameter_names
     }
     gem5_args = tuple(
@@ -227,13 +320,13 @@ def _run_config_from_log(sample_root: Path, config: PeregrineConfig) -> RunConfi
 def _build_workload_dataset(
     *,
     config: PeregrineConfig,
-    workload_root: Path,
     workload_id: str,
     samples: tuple[RawSample, ...],
     destination: Path,
     workers: int,
 ) -> int:
     schema = _dataset_schema(config)
+    table_context = _dataset_table_context(config)
     partial = destination.with_suffix(destination.suffix + ".partial")
     partial.unlink(missing_ok=True)
     rows = 0
@@ -246,11 +339,11 @@ def _build_workload_dataset(
             tables_by_group = executor.map(
                 lambda group: _feature_tables(
                     config=config,
-                    workload_root=workload_root,
                     workload_id=workload_id,
                     region_id=group[0],
                     samples=group[1],
                     schema=schema,
+                    table_context=table_context,
                 ),
                 groups,
             )
@@ -279,11 +372,11 @@ def _build_workload_dataset(
 def _feature_tables(
     *,
     config: PeregrineConfig,
-    workload_root: Path,
     workload_id: str,
     region_id: str,
     samples: tuple[RawSample, ...],
     schema: pa.Schema,
+    table_context: DatasetTableContext,
 ) -> tuple[pa.Table, ...]:
     trace_path = samples[0].trace_path
     row_configs = tuple(sample.config for sample in samples)
@@ -298,6 +391,7 @@ def _feature_tables(
             labels=labels,
             config=config,
             schema=schema,
+            table_context=table_context,
         )
         for batch in iter_anamol_feature_batches(
             trace_path=trace_path,
@@ -336,6 +430,28 @@ def _dataset_schema(config: PeregrineConfig) -> pa.Schema:
     )
 
 
+def _dataset_columns(config: PeregrineConfig) -> list[str]:
+    return [
+        *IDENTITY_COLUMNS,
+        *config.feature_columns,
+        *config.label_columns,
+    ]
+
+
+def _dataset_table_context(config: PeregrineConfig) -> DatasetTableContext:
+    return DatasetTableContext(
+        analytical_columns=analytical_feature_columns(config.microarchitecture.mechanisms),
+        categorical_values={
+            parameter_name: _categorical_values(parameter_name, config=config)
+            for parameter_name in config.categorical_design_parameter_names
+        },
+        reciprocal_parameters=tuple(
+            column.removeprefix("inv_")
+            for column in reciprocal_feature_columns()
+        ),
+    )
+
+
 def _dataset_table(
     *,
     workload_id: str,
@@ -345,10 +461,10 @@ def _dataset_table(
     labels: np.ndarray,
     config: PeregrineConfig,
     schema: pa.Schema,
+    table_context: DatasetTableContext,
 ) -> pa.Table:
     config_count = len(configs)
-    analytical_columns = analytical_feature_columns(config.microarchitecture.mechanisms)
-    if batch.values.shape != (config_count, len(analytical_columns)):
+    if batch.values.shape != (config_count, len(table_context.analytical_columns)):
         raise ValueError("Anamol feature batch dimensions differ from the configured contract")
     arrays: list[pa.Array] = [
         pa.array([workload_id] * config_count, type=pa.string()),
@@ -375,7 +491,7 @@ def _dataset_table(
             str(run_config.parameter_values[parameter_name])
             for run_config in configs
         )
-        for category in _categorical_values(parameter_name, config=config):
+        for category in table_context.categorical_values[parameter_name]:
             arrays.append(
                 pa.array(
                     np.fromiter(
@@ -386,21 +502,20 @@ def _dataset_table(
                     type=pa.float64(),
                 )
             )
-    reciprocal_parameters = tuple(
-        column.removeprefix("inv_")
-        for column in reciprocal_feature_columns()
-    )
+    analytical_configs = tuple(_analytical_config(item, config) for item in configs)
     arrays.extend(
         pa.array(
             np.fromiter(
-                (1.0 / float(_analytical_config(item, config)[parameter]) for item in configs),
+                (1.0 / float(item[parameter]) for item in analytical_configs),
                 dtype=np.float64,
                 count=config_count,
             ),
             type=pa.float64(),
         )
-        for parameter in reciprocal_parameters
+        for parameter in table_context.reciprocal_parameters
     )
+    if not np.isfinite(batch.values).all() or not np.isfinite(labels).all():
+        raise ValueError("dataset table contains non-finite generated values")
     arrays.extend(
         pa.array(labels[:, index], type=pa.float64())
         for index in range(labels.shape[1])
@@ -418,11 +533,7 @@ def _validate_dataset_shard(
     expected_rows: tuple[tuple[str, str], ...],
 ) -> None:
     shard = Path(path)
-    expected_columns = [
-        *IDENTITY_COLUMNS,
-        *config.feature_columns,
-        *config.label_columns,
-    ]
+    expected_columns = _dataset_columns(config)
     parquet = pq.ParquetFile(shard)
     if parquet.schema_arrow.names != expected_columns:
         raise ValueError(f"dataset shard contract differs from current source: {shard}")
@@ -431,7 +542,7 @@ def _validate_dataset_shard(
     row_count = len(expected_rows)
     if parquet.metadata.num_rows != row_count:
         raise ValueError(f"dataset shard row arithmetic differs from raw stats: {shard}")
-    frame = pq.read_table(shard, columns=expected_columns).to_pandas()
+    frame = pq.read_table(shard, columns=list(IDENTITY_COLUMNS)).to_pandas()
     if frame.duplicated(list(IDENTITY_COLUMNS)).any():
         raise ValueError(f"dataset shard contains duplicate identities: {shard}")
     if set(frame.workload_id.astype(str)) != {workload_id}:
@@ -449,11 +560,6 @@ def _validate_dataset_shard(
     )
     if observed != tuple(sorted(expected_rows)):
         raise ValueError(f"dataset shard sample identities differ: {shard}")
-    numeric = frame[
-        [*config.feature_columns, *config.label_columns]
-    ].to_numpy(dtype=np.float64)
-    if not np.isfinite(numeric).all():
-        raise ValueError(f"dataset shard contains non-finite values: {shard}")
 
 
 def _shard_stem(workload_id: str) -> str:

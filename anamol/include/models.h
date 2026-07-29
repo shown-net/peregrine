@@ -1,17 +1,11 @@
 #ifndef MODELS_H
 #define MODELS_H
 
-#include <array>
 #include <cstdint>
-#include <functional>
 #include <map>
-#include <optional>
-#include <string>
 #include <vector>
 
 #include "instr.h"
-#include "params_gen.h"    // ParamType, ParamSweep, PARAM_RANGES (generated)
-#include "resources_gen.h" // Resource enum (generated)
 
 namespace analytical {
 
@@ -20,83 +14,29 @@ uint64_t resp_cycle(uint64_t req_cycle, Instr instr,
                     std::map<uint64_t, uint64_t> last_req_cycles,
                     std::map<uint64_t, uint64_t> last_resp_cycles);
 
-////////////////////////////////////////////////////////////////////////////
-// Base Throughput Calculations (declarations auto-generated from registry.yaml)
-////////////////////////////////////////////////////////////////////////////
-#include "models_decl_gen.h"
-
-////////////////////////////////////////////////////////////////////////////
-// Resource Registry Entry
-////////////////////////////////////////////////////////////////////////////
-using ThrFunc = std::function<double(const std::vector<Instr>&,
-                                     const std::vector<uint16_t>&)>;
-
-// One entry per resource. RESOURCE_REGISTRY (in resource_registry.h, generated)
-// holds the full vector. models.cpp includes resource_registry.h directly.
-struct ResourceEntry {
-  Resource    resource;
-  const char* name;              // canonical name — used as .npy filename stem
-  bool        enabled;           // false → skip sweep, write no output file
-  bool        latency_dependent; // true → throughput depends on exe/fetch_latency;
-                                 //        must be re-run per cache config
-  ThrFunc     func;
-  ParamSweep  sweep;
-  std::vector<std::string> param_names;  // ordered param names driving this resource
-};
-
-////////////////////////////////////////////////////////////////////////////
-// Results
-////////////////////////////////////////////////////////////////////////////
-struct ThrVec {
-  std::vector<double> data;  // throughput for each window
-  bool double_params = false;
-  uint16_t p0 = 0;
-  uint16_t p1 = 0;
-};
-
-// One vector<ThrVec> per Resource enum value
-using PerResThrVecs =
-    std::array<std::vector<ThrVec>, static_cast<size_t>(Resource::COUNT)>;
-
-////////////////////////////////////////////////////////////////////////////
-// Main Entry
-////////////////////////////////////////////////////////////////////////////
-// latency_dep_filter: nullopt → run all enabled resources (default, existing behaviour)
-//                     true   → run only enabled && latency_dependent resources
-//                     false  → run only enabled && !latency_dependent resources
-PerResThrVecs get_throughput(std::vector<Instr> instr_trace,
-                             int window_size = 400,
-                             std::optional<bool> latency_dep_filter = std::nullopt);
-
-// Single-config variant: runs only for the specified param values (no sweep).
-// config maps param name → value for all params needed by enabled resources.
-PerResThrVecs get_throughput_single_config(
-    std::vector<Instr> instr_trace,
-    int window_size,
-    const std::map<std::string, uint16_t>& config,
-    std::optional<bool> latency_dep_filter = std::nullopt);
-
-void export_throughputs(PerResThrVecs PER_RES_THR_VECS, const std::string& output_dir);
-
-////////////////////////////////////////////////////////////////////////////
-// ROB Latency Analysis
-////////////////////////////////////////////////////////////////////////////
-struct RobLatencyData {
-  uint16_t rob_size;
-  double overall_throughput;
-  std::vector<uint32_t> issue_latencies;
-  std::vector<uint32_t> commit_latencies;
-  std::vector<uint32_t> exec_latencies;
-};
-
-// When rob_sizes is empty, sweeps the default {1, 2, 4, ..., 1024} set.
-// Pass a single element (or any subset) to compute only the ROB sizes you need.
-std::vector<RobLatencyData> get_rob_latency_analysis(
-    const std::vector<Instr>& instr_trace,
-    const std::vector<uint16_t>& rob_sizes = {});
-
-void export_latency_analysis(const std::vector<RobLatencyData>& latency_data,
-                             const std::string& output_dir);
+double get_thr_rob(const std::vector<Instr>& window, uint16_t rob_size);
+double get_thr_load_queue(const std::vector<Instr>& window,
+                          uint16_t load_queue_size);
+double get_thr_store_queue(const std::vector<Instr>& window,
+                           uint16_t store_queue_size);
+double get_thr_alu_issue(const std::vector<Instr>& window,
+                         uint16_t alu_issue_width);
+double get_thr_alu_mult_div_issue(const std::vector<Instr>& window,
+                                  uint16_t alu_mult_div_issue_width);
+double get_thr_fp_issue(const std::vector<Instr>& window,
+                        uint16_t fp_issue_width);
+double get_thr_fp_mult_div_issue(const std::vector<Instr>& window,
+                                 uint16_t fp_mult_div_issue_width);
+double get_thr_ls_issue(const std::vector<Instr>& window,
+                        uint16_t ls_issue_width);
+double get_thr_load_ls_pipes_lower(const std::vector<Instr>& window,
+                                   uint16_t num_ls_pipes,
+                                   uint16_t num_load_pipes);
+double get_thr_load_ls_pipes_upper(const std::vector<Instr>& window,
+                                   uint16_t num_ls_pipes,
+                                   uint16_t num_load_pipes);
+double get_thr_icache_fills(const std::vector<Instr>& window,
+                            uint16_t max_icache_fills);
 
 }  // namespace analytical
 

@@ -25,6 +25,7 @@ def _dataset_build(args: argparse.Namespace) -> int:
         raw_root=args.raw_root,
         output_dir=args.output_dir,
         workload_ids=tuple(args.workload_id or ()) or None,
+        manifest_path=args.manifest,
         workers=args.workers,
     )
     return _print_json(report)
@@ -99,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--metrics-config", required=True)
     build.add_argument("--microarchitecture-config", required=True)
     build.add_argument("--raw-root", required=True)
+    build.add_argument("--manifest", type=Path, default=None)
     build.add_argument("--output-dir", required=True)
     build.add_argument("--workload-id", action="append", default=[])
     build.add_argument("--workers", type=int, default=24)
