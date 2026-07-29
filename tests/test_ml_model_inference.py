@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +16,7 @@ from anamol.python.microarchitecture import load_microarchitecture_config
 from ml_model.inference import CpuMultiHeadPredictor
 from ml_model.inference import predict_parquet
 from ml_model.model import MultiHeadPeregrineModel
+from ml_model.train import evaluate_sample_split
 from ml_model.train import evaluate_workload_ood
 from ml_model.train import train_surrogate
 
@@ -145,6 +147,40 @@ def test_training_keeps_workload_ood_as_an_explicit_diagnostic(tmp_path: Path) -
         label_columns=("label_CPI",),
     )
     assert {item["heldout_workload"] for item in ood["workload_ood"]} == {"w0", "w1", "w2"}
+
+
+def test_sample_split_evaluation_uses_independent_test_rows(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    pd.DataFrame(
+        {
+            "workload_id": [f"w{index % 3}" for index in range(12)],
+            "region_id": [f"r{index}" for index in range(12)],
+            "config_id": [f"c{index}" for index in range(12)],
+            "f0": [float(index) for index in range(12)],
+            "f1": [float(index % 4) for index in range(12)],
+            "label_CPI": [1.0 + index * 0.1 for index in range(12)],
+        }
+    ).to_parquet(dataset / "samples.parquet", index=False)
+
+    report = evaluate_sample_split(
+        config=_training_config(),
+        dataset_dir=dataset,
+        output_dir=tmp_path / "evaluation",
+        feature_columns=("f0", "f1"),
+        label_columns=("label_CPI",),
+        output_metrics=("CPI",),
+    )
+    predictions = pq.read_table(tmp_path / "evaluation" / "test_predictions.parquet")
+    split = json.loads((tmp_path / "evaluation" / "split.json").read_text(encoding="utf-8"))
+
+    assert report["split"]["train_rows"] == 8
+    assert report["split"]["validation_rows"] == 2
+    assert report["split"]["test_rows"] == 2
+    assert predictions.num_rows == 2
+    assert predictions.column_names == ["workload_id", "region_id", "config_id", "prediction_CPI"]
+    assert set(split) == {"train", "validation", "test"}
+    assert not (set(split["train"]) & set(split["validation"]) | set(split["train"]) & set(split["test"]) | set(split["validation"]) & set(split["test"]))
 
 
 def test_prediction_failure_does_not_replace_existing_output(tmp_path: Path) -> None:

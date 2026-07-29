@@ -1,6 +1,6 @@
 collection:
   seed: 12345
-  configs_per_region: 16
+  configs_per_region: 32
 
 analysis:
   window_size: 400

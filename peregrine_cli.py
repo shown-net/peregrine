@@ -10,7 +10,15 @@ from anamol.python.microarchitecture import load_microarchitecture_config
 from anamol.python.dataset import build_dataset_shards
 from ml_model.inference import CpuMultiHeadPredictor
 from ml_model.inference import predict_parquet
+from ml_model.train import evaluate_sample_split
 from ml_model.train import train_surrogate
+
+
+DEFAULT_OUTPUT_ROOT = Path("output/no_cache_hnf_gem5_surrogate")
+DEFAULT_DATASET_DIR = DEFAULT_OUTPUT_ROOT / "dataset"
+DEFAULT_MODEL_DIR = DEFAULT_OUTPUT_ROOT / "model"
+DEFAULT_PREDICTIONS_DIR = DEFAULT_OUTPUT_ROOT / "predictions"
+DEFAULT_EVALUATION_DIR = DEFAULT_OUTPUT_ROOT / "evaluation"
 
 
 def _print_json(payload: dict) -> int:
@@ -38,6 +46,17 @@ def _model_train(args: argparse.Namespace) -> int:
 
 def _model_predict(args: argparse.Namespace) -> int:
     return _print_json(_predict_from_args(args))
+
+
+def _model_evaluate_split(args: argparse.Namespace) -> int:
+    config = load_peregrine_config(args.config, metrics_config=args.metrics_config, microarchitecture=load_microarchitecture_config(args.microarchitecture_config))
+    report = evaluate_sample_split(
+        config=config,
+        dataset_dir=args.dataset_dir,
+        output_dir=args.output_dir,
+        workload_ids=tuple(args.workload_id or ()) or None,
+    )
+    return _print_json(report)
 
 
 def _selected_workloads(dataset_dir: str | Path, workload_ids: list[str]) -> tuple[str, ...]:
@@ -101,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--microarchitecture-config", required=True)
     build.add_argument("--raw-root", required=True)
     build.add_argument("--manifest", type=Path, default=None)
-    build.add_argument("--output-dir", required=True)
+    build.add_argument("--output-dir", default=str(DEFAULT_DATASET_DIR))
     build.add_argument("--workload-id", action="append", default=[])
     build.add_argument("--workers", type=int, default=24)
     build.set_defaults(func=_dataset_build)
@@ -113,19 +132,28 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--metrics-config", required=True)
     train.add_argument("--microarchitecture-config", required=True)
     train.add_argument("--dataset-dir", required=True)
-    train.add_argument("--output-dir", required=True)
+    train.add_argument("--output-dir", default=str(DEFAULT_MODEL_DIR))
     train.add_argument("--workload-id", action="append", default=[])
     train.set_defaults(func=_model_train)
 
     predict = model_sub.add_parser("predict")
     predict.add_argument("--dataset-dir", required=True)
-    predict.add_argument("--model-dir", required=True)
-    predict.add_argument("--predictions-dir", required=True)
+    predict.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
+    predict.add_argument("--predictions-dir", default=str(DEFAULT_PREDICTIONS_DIR))
     predict.add_argument("--workload-id", action="append", default=[])
     predict.set_defaults(func=_model_predict)
 
     predict.add_argument("--batch-size", type=int, default=4096)
     predict.add_argument("--num-threads", type=int)
+
+    evaluate = model_sub.add_parser("evaluate-split")
+    evaluate.add_argument("--config", default="configs/peregrine.yaml")
+    evaluate.add_argument("--metrics-config", required=True)
+    evaluate.add_argument("--microarchitecture-config", required=True)
+    evaluate.add_argument("--dataset-dir", required=True)
+    evaluate.add_argument("--output-dir", default=str(DEFAULT_EVALUATION_DIR))
+    evaluate.add_argument("--workload-id", action="append", default=[])
+    evaluate.set_defaults(func=_model_evaluate_split)
 
     return parser
 

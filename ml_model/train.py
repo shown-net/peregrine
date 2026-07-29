@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, TensorDataset
@@ -87,9 +90,89 @@ def evaluate_workload_ood(
     }
 
 
+def evaluate_sample_split(
+    *,
+    config: PeregrineConfig,
+    dataset_dir: str | Path,
+    output_dir: str | Path,
+    train_fraction: float = 0.70,
+    validation_fraction: float = 0.15,
+    workload_ids: tuple[str, ...] | None = None,
+    feature_columns: tuple[str, ...] | None = None,
+    label_columns: tuple[str, ...] | None = None,
+    output_metrics: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    features = feature_columns or tuple(config.feature_columns)
+    labels = label_columns or tuple(config.label_columns)
+    metrics = output_metrics or tuple(label.removeprefix("label_") for label in labels)
+    if len(metrics) != len(labels):
+        raise ValueError("output metrics must match label columns")
+    frame = read_dataset_shards(
+        dataset_dir, columns=[*IDENTITY_COLUMNS, *features, *labels]
+    )
+    if workload_ids is not None:
+        frame = frame[frame.workload_id.isin(workload_ids)].copy()
+    _validate(frame, features, labels)
+    split = _train_validation_test_split(
+        len(frame),
+        config.training.seed,
+        train_fraction=train_fraction,
+        validation_fraction=validation_fraction,
+    )
+    if config.training.num_threads is not None:
+        torch.set_num_threads(config.training.num_threads)
+    x = frame.loc[:, features].to_numpy(dtype=np.float32)
+    y = frame.loc[:, labels].to_numpy(dtype=np.float32)
+    model, x_mean, x_scale, y_mean, y_scale, epochs = _fit(
+        config,
+        x[split.train],
+        y[split.train],
+        x[split.validation],
+        y[split.validation],
+        config.training.seed,
+        labels,
+    )
+    test_prediction = _predict(model, x[split.test], x_mean, x_scale, y_mean, y_scale)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    predictions_path = output / "test_predictions.parquet"
+    report_path = output / "metrics.json"
+    split_path = output / "split.json"
+    _write_test_predictions(
+        frame.loc[split.test, list(IDENTITY_COLUMNS)].reset_index(drop=True),
+        metrics,
+        test_prediction,
+        predictions_path,
+    )
+    split_report = {
+        "seed": config.training.seed,
+        "train_fraction": float(train_fraction),
+        "validation_fraction": float(validation_fraction),
+        "test_fraction": float(1.0 - train_fraction - validation_fraction),
+        "train_rows": int(split.train.sum()),
+        "validation_rows": int(split.validation.sum()),
+        "test_rows": int(split.test.sum()),
+        "epochs": epochs,
+    }
+    report = {
+        "output_dir": str(output),
+        "predictions": str(predictions_path),
+        "split": split_report,
+        **_error_metrics(labels, y[split.test], test_prediction),
+    }
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    split_path.write_text(json.dumps(split.identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
 class _Split:
     def __init__(self, train: np.ndarray, test: np.ndarray) -> None:
         self.train, self.test = train, test
+
+
+class _ThreeWaySplit:
+    def __init__(self, train: np.ndarray, validation: np.ndarray, test: np.ndarray, identity: dict[str, list[int]]) -> None:
+        self.train, self.validation, self.test, self.identity = train, validation, test, identity
 
 
 def _split(rows: int, seed: int, test_fraction: float) -> _Split:
@@ -98,6 +181,44 @@ def _split(rows: int, seed: int, test_fraction: float) -> _Split:
     test = np.zeros(rows, dtype=bool)
     test[order[:test_rows]] = True
     return _Split(~test, test)
+
+
+def _train_validation_test_split(
+    rows: int,
+    seed: int,
+    *,
+    train_fraction: float,
+    validation_fraction: float,
+) -> _ThreeWaySplit:
+    if rows < 3:
+        raise ValueError("train/validation/test split requires at least three rows")
+    test_fraction = 1.0 - train_fraction - validation_fraction
+    if train_fraction <= 0.0 or validation_fraction <= 0.0 or test_fraction <= 0.0:
+        raise ValueError("train, validation, and test fractions must be positive")
+    order = np.random.default_rng(seed).permutation(rows)
+    validation_rows = max(1, int(round(rows * validation_fraction)))
+    test_rows = max(1, int(round(rows * test_fraction)))
+    if validation_rows + test_rows >= rows:
+        raise ValueError("validation and test splits leave no training rows")
+    validation_idx = order[:validation_rows]
+    test_idx = order[validation_rows:validation_rows + test_rows]
+    train_idx = order[validation_rows + test_rows:]
+    train = np.zeros(rows, dtype=bool)
+    validation = np.zeros(rows, dtype=bool)
+    test = np.zeros(rows, dtype=bool)
+    train[train_idx] = True
+    validation[validation_idx] = True
+    test[test_idx] = True
+    return _ThreeWaySplit(
+        train,
+        validation,
+        test,
+        {
+            "train": sorted(int(index) for index in train_idx),
+            "validation": sorted(int(index) for index in validation_idx),
+            "test": sorted(int(index) for index in test_idx),
+        },
+    )
 
 
 def _fit(config: PeregrineConfig, train_x: np.ndarray, train_y: np.ndarray,
@@ -202,6 +323,13 @@ def _error_metrics(
         }
         for name, metric_values in values.items()
     }
+
+
+def _write_test_predictions(identity, output_metrics: tuple[str, ...], prediction: np.ndarray, path: Path) -> None:
+    table = pa.Table.from_pandas(identity, preserve_index=False)
+    for column, values in zip(output_metrics, prediction.T, strict=True):
+        table = table.append_column(f"prediction_{column}", pa.array(values))
+    pq.write_table(table, path, compression="zstd")
 
 
 def _validate(frame, features, labels) -> None:

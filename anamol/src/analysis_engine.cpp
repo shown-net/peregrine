@@ -115,7 +115,6 @@ struct CacheHierarchy {
   LruCache l1i;
   LruCache l1d;
   LruCache l2;
-  LruCache l3;
   uint64_t dram_latency;
 
   uint64_t access_instruction(uint64_t address) {
@@ -133,9 +132,6 @@ struct CacheHierarchy {
       return latency;
     latency += l2.latency();
     if (l2.access(address))
-      return latency;
-    latency += l3.latency();
-    if (l3.access(address))
       return latency;
     return latency + dram_latency;
   }
@@ -172,8 +168,6 @@ LatencyOverlay annotate_cache_latencies(
           config, "l1d_size", "l1_associativity", "l1d_data_latency")),
       LruCache(cache_config(
           config, "l2_size", "l2_associativity", "l2_data_latency")),
-      LruCache(cache_config(
-          config, "l3_size_kb", "l3_associativity", "hnf_data_latency")),
       require_u64(config, "dram_latency_cycles"),
   };
 

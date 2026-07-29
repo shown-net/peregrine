@@ -13,7 +13,6 @@ import yaml
 PARAMETER_SOURCES = ("host_fact", "simulator_default", "design")
 DESIGN_SOURCE = "design"
 GEM5_EMITS = ("always", "sampled", "never")
-EMITTED_GEM5 = frozenset(("always", "sampled"))
 SUPPORTED_COMPONENT_MODELS = frozenset(
     (
         "rob_capacity_latency_bound",
@@ -31,14 +30,11 @@ ANALYSIS_CACHE_INPUTS = frozenset(
         "l1i_size",
         "l1d_size",
         "l2_size",
-        "l3_size_kb",
         "l1_associativity",
         "l2_associativity",
-        "l3_associativity",
         "l1i_data_latency",
         "l1d_data_latency",
         "l2_data_latency",
-        "hnf_data_latency",
         "dram_latency_cycles",
     )
 )
@@ -147,7 +143,7 @@ class MicroarchitectureConfig:
         return tuple(
             parameter
             for parameter in self.parameters
-            if parameter.gem5_flag and parameter.gem5_emit in EMITTED_GEM5
+            if parameter.gem5_flag
         )
 
     @property
@@ -211,12 +207,12 @@ class MicroarchitectureConfig:
             if flag in by_flag:
                 raise ValueError(f"duplicate microarchitecture gem5 argument: {flag}")
             by_flag[flag] = raw
-        overrides: dict[str, int | float | str] = {}
-        for parameter in self.sampled_gem5_parameters:
+        values = dict(self.baseline_values)
+        for parameter in self.gem5_argument_parameters:
             if parameter.gem5_flag is None or parameter.gem5_flag not in by_flag:
                 raise ValueError(f"collection sample is missing canonical gem5 override: {parameter.name}")
-            overrides[parameter.name] = _parse(parameter, by_flag[parameter.gem5_flag])
-        return self.parameter_values(overrides)
+            values[parameter.name] = _parse(parameter, by_flag[parameter.gem5_flag])
+        return self.parameter_values(values)
 
     def analytical_values(self, overrides: Mapping[str, int | float | str] | None = None) -> Mapping[str, int | float | str]:
         values = self.parameter_values(overrides)

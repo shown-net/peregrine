@@ -102,8 +102,7 @@ def test_analytical_config_carries_configured_inputs_and_component_params() -> N
     columns = analytical_feature_columns(config.microarchitecture.mechanisms)
 
     assert config.microarchitecture.analysis.inputs["line_bytes"] == "cacheline_size"
-    assert config.microarchitecture.analysis.inputs["l3_size_kb"] == "hnf_size"
-    assert {"line_bytes", "l3_size_kb", "dram_latency_cycles"} <= set(analytical)
+    assert {"line_bytes", "l2_size", "dram_latency_cycles"} <= set(analytical)
     assert analytical["max_icache_fills"] > 0
     assert "dynamic_icache_fills_mean" in columns
 
@@ -247,9 +246,6 @@ def test_icache_fills_uses_configured_fetch_latency(tmp_path: Path) -> None:
         "l2_size": 1024,
         "l2_associativity": 8,
         "l2_data_latency": 6,
-        "l3_size_kb": 4096,
-        "l3_associativity": 16,
-        "hnf_data_latency": 12,
         "dram_latency_cycles": 70,
         "max_icache_fills": 1,
     }
@@ -339,6 +335,103 @@ def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeyp
     assert peregrine_cli._dataset_build(args) == 0
 
     assert calls[0]["manifest_path"] == tmp_path / "raw" / "manifest.json"
+
+
+def test_peregrine_cli_uses_owned_default_output_paths(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    sentinel_config = object()
+    sentinel_microarchitecture = object()
+    monkeypatch.setattr(peregrine_cli, "load_microarchitecture_config", lambda _path: sentinel_microarchitecture)
+    monkeypatch.setattr(
+        peregrine_cli,
+        "load_peregrine_config",
+        lambda _path, *, metrics_config, microarchitecture: sentinel_config,
+    )
+    monkeypatch.setattr(
+        peregrine_cli,
+        "build_dataset_shards",
+        lambda **kwargs: calls.append(("dataset", kwargs)) or {"dataset": kwargs["output_dir"], "shards": [], "workloads": []},
+    )
+    monkeypatch.setattr(
+        peregrine_cli,
+        "train_surrogate",
+        lambda **kwargs: calls.append(("train", kwargs)) or {"checkpoint": str(Path(kwargs["output_dir"]) / "checkpoint.pt")},
+    )
+    monkeypatch.setattr(
+        peregrine_cli,
+        "_predict_from_args",
+        lambda args: calls.append(("predict", {"model_dir": args.model_dir, "predictions_dir": args.predictions_dir})) or {"predictions_dir": args.predictions_dir, "workloads": []},
+    )
+
+    assert peregrine_cli.main([
+        "dataset", "build",
+        "--metrics-config", "metrics.yaml",
+        "--microarchitecture-config", "micro.yaml",
+        "--raw-root", str(tmp_path / "raw"),
+    ]) == 0
+    assert peregrine_cli.main([
+        "model", "train",
+        "--metrics-config", "metrics.yaml",
+        "--microarchitecture-config", "micro.yaml",
+        "--dataset-dir", str(tmp_path / "dataset"),
+    ]) == 0
+    assert peregrine_cli.main([
+        "model", "predict",
+        "--dataset-dir", str(tmp_path / "dataset"),
+    ]) == 0
+
+    assert calls[0][1]["output_dir"] == str(peregrine_cli.DEFAULT_DATASET_DIR)
+    assert calls[1][1]["output_dir"] == str(peregrine_cli.DEFAULT_MODEL_DIR)
+    assert calls[2][1] == {
+        "model_dir": str(peregrine_cli.DEFAULT_MODEL_DIR),
+        "predictions_dir": str(peregrine_cli.DEFAULT_PREDICTIONS_DIR),
+    }
+
+
+def test_peregrine_cli_explicit_paths_override_owned_defaults(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        peregrine_cli,
+        "_predict_from_args",
+        lambda args: calls.append({"model_dir": args.model_dir, "predictions_dir": args.predictions_dir}) or {"predictions_dir": args.predictions_dir, "workloads": []},
+    )
+
+    model_dir = tmp_path / "model"
+    predictions_dir = tmp_path / "predictions"
+    assert peregrine_cli.main([
+        "model", "predict",
+        "--dataset-dir", str(tmp_path / "dataset"),
+        "--model-dir", str(model_dir),
+        "--predictions-dir", str(predictions_dir),
+    ]) == 0
+
+    assert calls == [{"model_dir": str(model_dir), "predictions_dir": str(predictions_dir)}]
+
+
+def test_peregrine_cli_uses_owned_default_evaluation_path(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    sentinel_config = object()
+    sentinel_microarchitecture = object()
+    monkeypatch.setattr(peregrine_cli, "load_microarchitecture_config", lambda _path: sentinel_microarchitecture)
+    monkeypatch.setattr(
+        peregrine_cli,
+        "load_peregrine_config",
+        lambda _path, *, metrics_config, microarchitecture: sentinel_config,
+    )
+    monkeypatch.setattr(
+        peregrine_cli,
+        "evaluate_sample_split",
+        lambda **kwargs: calls.append(kwargs) or {"output_dir": kwargs["output_dir"], "split": {}},
+    )
+
+    assert peregrine_cli.main([
+        "model", "evaluate-split",
+        "--metrics-config", "metrics.yaml",
+        "--microarchitecture-config", "micro.yaml",
+        "--dataset-dir", str(tmp_path / "dataset"),
+    ]) == 0
+
+    assert calls[0]["output_dir"] == str(peregrine_cli.DEFAULT_EVALUATION_DIR)
 
 
 def test_dataset_build_uses_final_raw_samples_and_parallel_trace_groups(tmp_path: Path, monkeypatch) -> None:
@@ -801,9 +894,6 @@ def _cache_config() -> dict[str, int]:
         "l2_size": 1024,
         "l2_associativity": 8,
         "l2_data_latency": 6,
-        "l3_size_kb": 4096,
-        "l3_associativity": 16,
-        "hnf_data_latency": 12,
         "dram_latency_cycles": 70,
     }
 
