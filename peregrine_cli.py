@@ -8,10 +8,17 @@ from pathlib import Path
 from anamol.python.design_space import load_peregrine_config
 from anamol.python.microarchitecture import load_microarchitecture_config
 from anamol.python.dataset import build_dataset_shards
-from ml_model.inference import CpuMultiHeadPredictor
-from ml_model.inference import predict_parquet
-from ml_model.train import evaluate_sample_split
-from ml_model.train import train_surrogate
+from ml_model.inference import PredictorBundle
+from ml_model.inference import predict_bundle_parquet
+from ml_model.plots import plot_l1_summary
+from ml_model.prediction import train_prediction_task
+from ml_model.prediction import evaluate_prediction_task
+from ml_model.prediction import evaluate_random_roi_split_prediction_task
+from ml_model.real_anchor import build_real_anchor_dataset
+from ml_model.tasks import L1_TASK_ID
+from ml_model.tasks import L3_TASK_ID
+from ml_model.tasks import l1_task
+from ml_model.tasks import l3_task
 
 
 DEFAULT_OUTPUT_ROOT = Path("output/no_cache_hnf_gem5_surrogate")
@@ -27,6 +34,11 @@ def _print_json(payload: dict) -> int:
 
 
 def _dataset_build(args: argparse.Namespace) -> int:
+    if args.task == L3_TASK_ID:
+        return _print_json(build_real_anchor_dataset(
+            raw_root=args.raw_root, metrics_config=args.metrics_config,
+            output_dir=args.output_dir, workload_ids=tuple(args.workload_id or ()) or None,
+        ))
     config = load_peregrine_config(args.config, metrics_config=args.metrics_config, microarchitecture=load_microarchitecture_config(args.microarchitecture_config))
     report = build_dataset_shards(
         config=config,
@@ -40,23 +52,34 @@ def _dataset_build(args: argparse.Namespace) -> int:
 
 
 def _model_train(args: argparse.Namespace) -> int:
-    config = load_peregrine_config(args.config, metrics_config=args.metrics_config, microarchitecture=load_microarchitecture_config(args.microarchitecture_config))
-    return _print_json(_train_from_args(args, config=config))
+    return _print_json(train_prediction_task(
+        task=_task_from_args(args), dataset_dir=args.dataset_dir, output_dir=args.output_dir,
+        workload_ids=tuple(args.workload_id or ()) or None,
+    ))
 
 
 def _model_predict(args: argparse.Namespace) -> int:
     return _print_json(_predict_from_args(args))
 
 
-def _model_evaluate_split(args: argparse.Namespace) -> int:
-    config = load_peregrine_config(args.config, metrics_config=args.metrics_config, microarchitecture=load_microarchitecture_config(args.microarchitecture_config))
-    report = evaluate_sample_split(
-        config=config,
-        dataset_dir=args.dataset_dir,
-        output_dir=args.output_dir,
-        workload_ids=tuple(args.workload_id or ()) or None,
+def _model_evaluate(args: argparse.Namespace) -> int:
+    evaluate = (
+        evaluate_prediction_task
+        if args.protocol == "workload-ood" else evaluate_random_roi_split_prediction_task
     )
-    return _print_json(report)
+    return _print_json(evaluate(
+        task=_task_from_args(args), dataset_dir=args.dataset_dir, output_dir=args.output_dir,
+        workload_ids=tuple(args.workload_id or ()) or None,
+    ))
+
+
+def _plot_l1_summary(args: argparse.Namespace) -> int:
+    return _print_json(plot_l1_summary(
+        dataset_dir=args.dataset_dir,
+        workload_ood_dir=args.workload_ood_dir,
+        random_roi_dir=args.random_roi_dir,
+        output_dir=args.output_dir,
+    ))
 
 
 def _selected_workloads(dataset_dir: str | Path, workload_ids: list[str]) -> tuple[str, ...]:
@@ -65,37 +88,28 @@ def _selected_workloads(dataset_dir: str | Path, workload_ids: list[str]) -> tup
     )
 
 
-def _train_from_args(
-    args: argparse.Namespace,
-    *,
-    config,
-    feature_columns: tuple[str, ...] | None = None,
-    label_columns: tuple[str, ...] | None = None,
-    output_metrics: tuple[str, ...] | None = None,
-) -> dict:
-    report = train_surrogate(
-        config=config,
-        dataset_dir=args.dataset_dir,
-        output_dir=args.output_dir,
-        workload_ids=tuple(args.workload_id or ()) or None,
-        feature_columns=feature_columns,
-        label_columns=label_columns,
-        output_metrics=output_metrics,
-    )
-    return report
+def _task_from_args(args: argparse.Namespace):
+    if args.task == L3_TASK_ID:
+        return l3_task()
+    if args.task == L1_TASK_ID:
+        if not args.microarchitecture_config:
+            raise ValueError("l1-surrogate requires --microarchitecture-config")
+        config = load_peregrine_config(
+            args.config, metrics_config=args.metrics_config,
+            microarchitecture=load_microarchitecture_config(args.microarchitecture_config),
+        )
+        return l1_task(config)
+    raise ValueError(f"unknown prediction task: {args.task}")
 
 
 def _predict_from_args(args: argparse.Namespace) -> dict:
     workload_ids = _selected_workloads(args.dataset_dir, args.workload_id)
     predictions_root = Path(args.predictions_dir)
     predictions_root.mkdir(parents=True, exist_ok=True)
-    predictor = CpuMultiHeadPredictor(
-        Path(args.model_dir) / "checkpoint.pt",
-        num_threads=args.num_threads,
-    )
+    predictor = PredictorBundle(Path(args.model_dir) / "predictor_bundle.json", num_threads=args.num_threads)
     reports = tuple({
         "workload_id": workload_id,
-        **predict_parquet(
+        **predict_bundle_parquet(
             predictor=predictor,
             features_path=Path(args.dataset_dir) / f"{workload_id}.parquet",
             output_path=predictions_root / f"{workload_id}.parquet",
@@ -115,9 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
     dataset = sub.add_parser("dataset")
     dataset_sub = dataset.add_subparsers(dest="action", required=True)
     build = dataset_sub.add_parser("build")
+    build.add_argument("--task", choices=(L1_TASK_ID, L3_TASK_ID), required=True)
     build.add_argument("--config", default="configs/peregrine.yaml")
     build.add_argument("--metrics-config", required=True)
-    build.add_argument("--microarchitecture-config", required=True)
+    build.add_argument("--microarchitecture-config")
     build.add_argument("--raw-root", required=True)
     build.add_argument("--manifest", type=Path, default=None)
     build.add_argument("--output-dir", default=str(DEFAULT_DATASET_DIR))
@@ -128,9 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
     model = sub.add_parser("model")
     model_sub = model.add_subparsers(dest="action", required=True)
     train = model_sub.add_parser("train")
+    train.add_argument("--task", choices=(L1_TASK_ID, L3_TASK_ID), required=True)
     train.add_argument("--config", default="configs/peregrine.yaml")
     train.add_argument("--metrics-config", required=True)
-    train.add_argument("--microarchitecture-config", required=True)
+    train.add_argument("--microarchitecture-config")
     train.add_argument("--dataset-dir", required=True)
     train.add_argument("--output-dir", default=str(DEFAULT_MODEL_DIR))
     train.add_argument("--workload-id", action="append", default=[])
@@ -146,14 +162,25 @@ def build_parser() -> argparse.ArgumentParser:
     predict.add_argument("--batch-size", type=int, default=4096)
     predict.add_argument("--num-threads", type=int)
 
-    evaluate = model_sub.add_parser("evaluate-split")
+    evaluate = model_sub.add_parser("evaluate")
+    evaluate.add_argument("--task", choices=(L1_TASK_ID, L3_TASK_ID), required=True)
     evaluate.add_argument("--config", default="configs/peregrine.yaml")
     evaluate.add_argument("--metrics-config", required=True)
-    evaluate.add_argument("--microarchitecture-config", required=True)
+    evaluate.add_argument("--microarchitecture-config")
     evaluate.add_argument("--dataset-dir", required=True)
     evaluate.add_argument("--output-dir", default=str(DEFAULT_EVALUATION_DIR))
     evaluate.add_argument("--workload-id", action="append", default=[])
-    evaluate.set_defaults(func=_model_evaluate_split)
+    evaluate.add_argument("--protocol", choices=("workload-ood", "random-roi"), default="workload-ood")
+    evaluate.set_defaults(func=_model_evaluate)
+
+    plot = sub.add_parser("plot")
+    plot_sub = plot.add_subparsers(dest="action", required=True)
+    l1_summary = plot_sub.add_parser("l1-summary")
+    l1_summary.add_argument("--dataset-dir", default=str(DEFAULT_DATASET_DIR))
+    l1_summary.add_argument("--workload-ood-dir", default=str(DEFAULT_OUTPUT_ROOT / "unified_ood"))
+    l1_summary.add_argument("--random-roi-dir", default=str(DEFAULT_EVALUATION_DIR))
+    l1_summary.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "plots_l1"))
+    l1_summary.set_defaults(func=_plot_l1_summary)
 
     return parser
 

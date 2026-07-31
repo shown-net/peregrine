@@ -317,8 +317,10 @@ def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeyp
     )
     args = peregrine_cli.build_parser().parse_args(
         [
-            "dataset",
-            "build",
+                "dataset",
+                "build",
+                "--task",
+                "l1-surrogate",
             "--metrics-config",
             "metrics.yaml",
             "--microarchitecture-config",
@@ -354,9 +356,10 @@ def test_peregrine_cli_uses_owned_default_output_paths(tmp_path: Path, monkeypat
     )
     monkeypatch.setattr(
         peregrine_cli,
-        "train_surrogate",
-        lambda **kwargs: calls.append(("train", kwargs)) or {"checkpoint": str(Path(kwargs["output_dir"]) / "checkpoint.pt")},
+        "train_prediction_task",
+        lambda **kwargs: calls.append(("train", kwargs)) or {"bundle": str(Path(kwargs["output_dir"]) / "predictor_bundle.json")},
     )
+    monkeypatch.setattr(peregrine_cli, "_task_from_args", lambda _args: sentinel_config)
     monkeypatch.setattr(
         peregrine_cli,
         "_predict_from_args",
@@ -365,12 +368,14 @@ def test_peregrine_cli_uses_owned_default_output_paths(tmp_path: Path, monkeypat
 
     assert peregrine_cli.main([
         "dataset", "build",
+        "--task", "l1-surrogate",
         "--metrics-config", "metrics.yaml",
         "--microarchitecture-config", "micro.yaml",
         "--raw-root", str(tmp_path / "raw"),
     ]) == 0
     assert peregrine_cli.main([
         "model", "train",
+        "--task", "l3-real-anchor",
         "--metrics-config", "metrics.yaml",
         "--microarchitecture-config", "micro.yaml",
         "--dataset-dir", str(tmp_path / "dataset"),
@@ -420,12 +425,14 @@ def test_peregrine_cli_uses_owned_default_evaluation_path(tmp_path: Path, monkey
     )
     monkeypatch.setattr(
         peregrine_cli,
-        "evaluate_sample_split",
-        lambda **kwargs: calls.append(kwargs) or {"output_dir": kwargs["output_dir"], "split": {}},
+        "evaluate_prediction_task",
+        lambda **kwargs: calls.append(kwargs) or {"output_dir": kwargs["output_dir"]},
     )
+    monkeypatch.setattr(peregrine_cli, "_task_from_args", lambda _args: sentinel_config)
 
     assert peregrine_cli.main([
-        "model", "evaluate-split",
+        "model", "evaluate",
+        "--task", "l3-real-anchor",
         "--metrics-config", "metrics.yaml",
         "--microarchitecture-config", "micro.yaml",
         "--dataset-dir", str(tmp_path / "dataset"),

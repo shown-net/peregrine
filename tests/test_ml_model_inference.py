@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
@@ -12,13 +13,116 @@ from anamol.python.design_space import AnalysisConfig
 from anamol.python.design_space import CollectionSamplingConfig
 from anamol.python.design_space import PeregrineConfig
 from anamol.python.design_space import TrainingConfig
+from anamol.python.design_space import load_peregrine_config
 from anamol.python.microarchitecture import load_microarchitecture_config
 from ml_model.inference import CpuMultiHeadPredictor
 from ml_model.inference import predict_parquet
 from ml_model.model import MultiHeadPeregrineModel
-from ml_model.train import evaluate_sample_split
-from ml_model.train import evaluate_workload_ood
-from ml_model.train import train_surrogate
+from ml_model import real_anchor
+from ml_model.multitask import LOG1P_NONNEGATIVE_TARGET_TRANSFORM
+from ml_model.multitask import MultiHeadTraining
+from ml_model.multitask import inverse_transform_targets
+from ml_model.multitask import regression_error_report
+from ml_model.multitask import scale
+from ml_model.multitask import standardize
+from ml_model.plots import plot_l1_summary
+from ml_model.prediction import FeatureSet
+from ml_model.prediction import PredictionTask
+from ml_model.prediction import evaluate_prediction_task
+from ml_model.prediction import evaluate_random_roi_split_prediction_task
+from ml_model.prediction import train_prediction_task
+from ml_model.tasks import l1_task
+
+
+def test_prediction_task_bundle_uses_paths_relative_to_its_own_directory(tmp_path: Path, monkeypatch) -> None:
+    from ml_model.prediction import FeatureSet
+    from ml_model.prediction import PredictionTask
+    from ml_model.prediction import train_prediction_task
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    rows = []
+    for workload_index, workload in enumerate(("w0", "w1", "w2")):
+        for interval in range(2):
+            value = float(workload_index + interval + 1)
+            rows.append({
+                "workload_id": workload,
+                "interval_index": interval,
+                "feature_raw": value,
+                "feature_model": value,
+                "label_raw": value,
+                "label_model": value * 2.0,
+            })
+    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
+    task = PredictionTask(
+        task_id="synthetic",
+        identity_columns=("workload_id", "interval_index"),
+        group_column="workload_id",
+        feature_set=FeatureSet("core", ("feature_model",)),
+        label_columns=("label_raw", "label_model"),
+        output_metrics=("raw", "model"),
+        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
+        num_threads=1,
+        seed=7,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    report = train_prediction_task(task=task, dataset_dir=dataset, output_dir=Path("model"))
+
+    training = json.loads(Path(report["training_report"]).read_text())
+    assert training["protocol"] == "full_dataset_deployment_training"
+    assert set(training["selected"]) == {"raw", "model"}
+    assert Path(report["bundle"]).is_file()
+    from ml_model.inference import PredictorBundle
+    PredictorBundle(report["bundle"])
+
+
+def test_predictor_bundle_combines_singlehead_outputs(tmp_path: Path) -> None:
+    from ml_model.inference import PredictorBundle
+    from ml_model.inference import predict_bundle_parquet
+
+    checkpoint = tmp_path / "model.pt"
+    model = MultiHeadPeregrineModel(1, (4, 3), ("label_raw",))
+    torch.save({
+        "state_dict": model.state_dict(), "feature_columns": ("feature_model",),
+        "label_columns": ("label_raw",), "output_metrics": ("raw",),
+        "hidden_dims": (4, 3), "num_threads": 1,
+        "feature_mean": torch.zeros(1), "feature_scale": torch.ones(1),
+        "label_mean": torch.zeros(1), "label_scale": torch.ones(1),
+    }, checkpoint)
+    model_output = tmp_path / "model-output.pt"
+    model = MultiHeadPeregrineModel(1, (4, 3), ("label_model",))
+    torch.save({
+        "state_dict": model.state_dict(), "feature_columns": ("feature_model",),
+        "label_columns": ("label_model",), "output_metrics": ("model",),
+        "hidden_dims": (4, 3), "num_threads": 1,
+        "feature_mean": torch.zeros(1), "feature_scale": torch.ones(1),
+        "label_mean": torch.zeros(1), "label_scale": torch.ones(1),
+    }, model_output)
+    bundle_path = tmp_path / "predictor_bundle.json"
+    bundle_path.write_text(json.dumps({
+        "task_id": "synthetic", "identity_columns": ["workload_id", "interval_index"],
+        "output_metrics": ["raw", "model"],
+        "selected": {
+            "raw": {"candidate_id": "singlehead:core:raw", "predictor_kind": "singlehead", "feature_set": "core"},
+            "model": {"candidate_id": "singlehead:core:model", "predictor_kind": "singlehead", "feature_set": "core"},
+        },
+        "model_paths": {"singlehead:core:raw": str(checkpoint), "singlehead:core:model": str(model_output)},
+    }))
+    source = tmp_path / "features.parquet"
+    pd.DataFrame({
+        "workload_id": ["w0"], "interval_index": [0],
+        "feature_raw": [3.0], "feature_model": [2.0],
+    }).to_parquet(source, index=False)
+    destination = tmp_path / "prediction.parquet"
+
+    report = predict_bundle_parquet(
+        predictor=PredictorBundle(bundle_path), features_path=source, output_path=destination,
+    )
+
+    table = pq.read_table(destination)
+    assert report["rows"] == 1
+    assert table.column_names == ["workload_id", "interval_index", "prediction_raw", "prediction_model"]
 
 
 def test_checkpoint_drives_dynamic_prediction_outputs(tmp_path: Path) -> None:
@@ -113,7 +217,35 @@ def test_predict_array_is_batch_size_invariant(tmp_path: Path) -> None:
     assert small.shape == (5, 2)
 
 
-def test_training_keeps_workload_ood_as_an_explicit_diagnostic(tmp_path: Path) -> None:
+def test_log1p_nonnegative_checkpoint_clamps_physical_predictions(tmp_path: Path) -> None:
+    feature_columns = ("f0",)
+    label_columns = ("label_CPI",)
+    model = MultiHeadPeregrineModel(len(feature_columns), (4, 3), label_columns)
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "feature_columns": feature_columns,
+            "label_columns": label_columns,
+            "output_metrics": ("CPI",),
+            "hidden_dims": (4, 3),
+            "num_threads": 1,
+            "feature_mean": torch.zeros(len(feature_columns)),
+            "feature_scale": torch.ones(len(feature_columns)),
+            "label_mean": torch.full((1,), -100.0),
+            "label_scale": torch.ones(len(label_columns)),
+            "target_transforms": (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,),
+        },
+        checkpoint,
+    )
+    predictor = CpuMultiHeadPredictor(checkpoint)
+    predictions = predictor.predict_array(__import__("numpy").array([[0.0], [1.0]], dtype="float32"))
+
+    assert (predictions >= 0.0).all()
+    assert predictor.target_transforms == (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,)
+
+
+def test_l1_evaluation_uses_shared_ood_report_contract(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     pd.DataFrame(
@@ -126,61 +258,18 @@ def test_training_keeps_workload_ood_as_an_explicit_diagnostic(tmp_path: Path) -
             "label_CPI": [1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
         }
     ).to_parquet(dataset / "samples.parquet", index=False)
-    config = _training_config()
-
-    report = train_surrogate(
-        config=config,
-        dataset_dir=dataset,
-        output_dir=tmp_path / "model",
-        feature_columns=("f0", "f1"),
-        label_columns=("label_CPI",),
-        output_metrics=("CPI",),
-    )
-    errors = report["random_split"]
-    for name in ("mae", "rmse", "wape", "smape"):
-        assert set(errors[name]) == {"CPI"}
-        assert __import__("numpy").isfinite(errors[name]["CPI"])
-    ood = evaluate_workload_ood(
-        config=config,
-        dataset_dir=dataset,
-        feature_columns=("f0", "f1"),
-        label_columns=("label_CPI",),
-    )
-    assert {item["heldout_workload"] for item in ood["workload_ood"]} == {"w0", "w1", "w2"}
-
-
-def test_sample_split_evaluation_uses_independent_test_rows(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    pd.DataFrame(
-        {
-            "workload_id": [f"w{index % 3}" for index in range(12)],
-            "region_id": [f"r{index}" for index in range(12)],
-            "config_id": [f"c{index}" for index in range(12)],
-            "f0": [float(index) for index in range(12)],
-            "f1": [float(index % 4) for index in range(12)],
-            "label_CPI": [1.0 + index * 0.1 for index in range(12)],
-        }
-    ).to_parquet(dataset / "samples.parquet", index=False)
-
-    report = evaluate_sample_split(
-        config=_training_config(),
-        dataset_dir=dataset,
-        output_dir=tmp_path / "evaluation",
-        feature_columns=("f0", "f1"),
-        label_columns=("label_CPI",),
-        output_metrics=("CPI",),
-    )
-    predictions = pq.read_table(tmp_path / "evaluation" / "test_predictions.parquet")
-    split = json.loads((tmp_path / "evaluation" / "split.json").read_text(encoding="utf-8"))
-
-    assert report["split"]["train_rows"] == 8
-    assert report["split"]["validation_rows"] == 2
-    assert report["split"]["test_rows"] == 2
-    assert predictions.num_rows == 2
-    assert predictions.column_names == ["workload_id", "region_id", "config_id", "prediction_CPI"]
-    assert set(split) == {"train", "validation", "test"}
-    assert not (set(split["train"]) & set(split["validation"]) | set(split["train"]) & set(split["test"]) | set(split["validation"]) & set(split["test"]))
+    task = _test_task(feature_columns=("f0", "f1"), label_columns=("label_CPI",), output_metrics=("CPI",))
+    report = evaluate_prediction_task(task=task, dataset_dir=dataset, output_dir=tmp_path / "evaluation")
+    evaluation = json.loads(Path(report["evaluation"]).read_text())
+    assert evaluation["primary_metric"] == {
+        "aggregation": "macro_workload", "metric": "mape_pct", "target": "CPI",
+    }
+    errors = evaluation["metrics"]["roi_weighted"]["CPI"]
+    assert set(errors) == {
+        "mae", "rmse", "mape_pct", "mape_nonzero_rows",
+        "p90_absolute_error", "wape_pct", "smape_pct",
+    }
+    assert all(__import__("numpy").isfinite(errors[name]) for name in ("mae", "rmse", "mape_pct", "p90_absolute_error", "wape_pct", "smape_pct"))
 
 
 def test_prediction_failure_does_not_replace_existing_output(tmp_path: Path) -> None:
@@ -233,13 +322,279 @@ def test_training_rejects_a_constant_label(tmp_path: Path) -> None:
     ).to_parquet(dataset / "samples.parquet", index=False)
 
     with pytest.raises(ValueError, match="zero-variance labels"):
-        train_surrogate(
-            config=_training_config(),
+        train_prediction_task(
+            task=_test_task(feature_columns=("f0",), label_columns=("label_constant",), output_metrics=("constant",)),
+            dataset_dir=dataset, output_dir=tmp_path / "model",
+        )
+
+
+def test_l3_task_uses_workload_interval_identity_and_singlehead_models(tmp_path: Path) -> None:
+    from ml_model.prediction import train_prediction_task
+    from ml_model.tasks import l3_task
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    rows = []
+    for workload in ("w0", "w1", "w2"):
+        for interval in range(2):
+            row = {"workload_id": workload, "interval_index": interval}
+            for index, column in enumerate(real_anchor.P2_FEATURES):
+                row[column] = float(index + interval + 1)
+            for index, metric in enumerate(real_anchor.target_names()):
+                row[f"label_{metric}"] = float(index + interval + 1)
+            rows.append(row)
+    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
+    task = replace(l3_task(), training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1), num_threads=1)
+    report = train_prediction_task(task=task, dataset_dir=dataset, output_dir=tmp_path / "model")
+    training = json.loads(Path(report["training_report"]).read_text())
+
+    assert set(training["selected"]) == set(real_anchor.target_names())
+    assert all(item["predictor_kind"] == "singlehead" for item in training["selected"].values())
+
+
+def test_shared_error_report_uses_percentage_units_and_zero_safe_mape() -> None:
+    report = regression_error_report(
+        ("label_CPI",),
+        __import__("numpy").array([[0.0], [2.0]], dtype="float32"),
+        __import__("numpy").array([[1.0], [1.0]], dtype="float32"),
+    )["CPI"]
+
+    assert report["mae"] == 1.0
+    assert report["rmse"] == 1.0
+    assert report["mape_pct"] == 50.0
+    assert report["mape_nonzero_rows"] == 1
+    assert report["p90_absolute_error"] == 1.0
+    assert report["wape_pct"] == 100.0
+    assert report["smape_pct"] == pytest.approx(133.33333333333334)
+
+
+def test_macro_workload_mape_does_not_follow_roi_sample_counts() -> None:
+    from ml_model.prediction import _macro_workload_report
+
+    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
+    values = __import__("numpy").array(["small", "large", "large", "large"])
+    truth = __import__("numpy").full((4, 1), 10.0, dtype="float32")
+    prediction = __import__("numpy").array([[0.0], [10.0], [10.0], [10.0]], dtype="float32")
+
+    macro = _macro_workload_report(task, values, truth, prediction)["CPI"]
+    roi = regression_error_report(task.label_columns, truth, prediction)["CPI"]
+
+    assert macro["mape_pct"] == 50.0
+    assert roi["mape_pct"] == 25.0
+
+
+def test_log1p_inverse_transform_is_nonnegative() -> None:
+    restored = inverse_transform_targets(
+        __import__("numpy").array([[-100.0], [0.0], [100.0]], dtype="float32"),
+        (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,),
+    )
+
+    assert (restored >= 0.0).all()
+    assert __import__("numpy").isfinite(restored).all()
+
+
+def test_standardize_bounds_a_constant_training_feature_outside_support() -> None:
+    mean, scale_value = standardize(__import__("numpy").array([[400.0], [400.0]], dtype="float32"))
+    heldout = scale(__import__("numpy").array([[100.0]], dtype="float32"), mean, scale_value)
+
+    assert scale_value.tolist() == [1.0]
+    assert heldout.tolist() == [[-8.0]]
+
+
+def test_l1_task_uses_one_full_feature_singlehead_protocol() -> None:
+    task = l1_task(load_peregrine_config(
+        "configs/peregrine.yaml", metrics_config="../cpu_microarchitecture/configs/metrics.yaml",
+        microarchitecture=load_microarchitecture_config("../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml"),
+    ))
+
+    assert task.feature_set.feature_set_id == "trace_design"
+
+
+def test_workload_ood_evaluation_excludes_heldout_labels_from_its_prediction(tmp_path: Path) -> None:
+    def write_dataset(path: Path, heldout_offset: float) -> None:
+        path.mkdir()
+        rows = []
+        for workload_index, workload in enumerate(("w0", "w1", "w2", "w3")):
+            for interval in range(3):
+                rows.append({
+                    "workload_id": workload, "region_id": f"{workload}_{interval}",
+                    "config_id": f"c_{workload}_{interval}", "f0": float(workload_index + interval),
+                    "label_CPI": float(workload_index + interval + 1 + (heldout_offset if workload == "w0" else 0.0)),
+                })
+        pd.DataFrame(rows).to_parquet(path / "samples.parquet", index=False)
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    write_dataset(first, 0.0)
+    write_dataset(second, 100.0)
+    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
+
+    first_report = evaluate_prediction_task(task=task, dataset_dir=first, output_dir=tmp_path / "first-evaluation")
+    second_report = evaluate_prediction_task(task=task, dataset_dir=second, output_dir=tmp_path / "second-evaluation")
+
+    first_oof = pd.read_parquet(first_report["oof_predictions"])
+    second_oof = pd.read_parquet(second_report["oof_predictions"])
+    first_w0 = first_oof.loc[first_oof.workload_id == "w0", "prediction_CPI"].to_numpy()
+    second_w0 = second_oof.loc[second_oof.workload_id == "w0", "prediction_CPI"].to_numpy()
+    evaluation = json.loads(Path(first_report["evaluation"]).read_text())
+    assert __import__("numpy").allclose(first_w0, second_w0)
+    assert evaluation["protocol"] == "leave_one_workload_out"
+    assert evaluation["generalization_scope"] == "joint_program_microarchitecture_ood"
+    assert not (tmp_path / "first-evaluation" / "predictor_bundle.json").exists()
+
+
+def test_random_roi_evaluation_reports_the_historical_id_split(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    pd.DataFrame({
+        "workload_id": [f"w{index % 3}" for index in range(20)],
+        "region_id": [f"r{index}" for index in range(20)],
+        "config_id": [f"c{index}" for index in range(20)],
+        "f0": [float(index) for index in range(20)],
+        "label_CPI": [float(index + 1) for index in range(20)],
+    }).to_parquet(dataset / "samples.parquet", index=False)
+
+    report = evaluate_random_roi_split_prediction_task(
+        task=_test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",)),
+        dataset_dir=dataset, output_dir=tmp_path / "evaluation",
+    )
+
+    evaluation = json.loads(Path(report["evaluation"]).read_text())
+    split = evaluation["split"]
+    assert evaluation["protocol"] == "random_roi_split"
+    assert evaluation["primary_metric"] == {
+        "aggregation": "roi_weighted", "metric": "mape_pct", "target": "CPI",
+    }
+    assert split["train_rows"] + split["validation_rows"] + split["test_rows"] == 20
+    assert set(evaluation["metrics"]["roi_weighted"]) == {"CPI"}
+    assert pq.read_table(report["test_predictions"]).num_rows == split["test_rows"]
+
+
+def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    ood = tmp_path / "unified_ood"
+    random_roi = tmp_path / "evaluation"
+    plots = tmp_path / "plots"
+    dataset.mkdir()
+    ood.mkdir()
+    random_roi.mkdir()
+    metrics = (
+        "CPI",
+        "BRANCH_MPKI",
+        "CHI_L1I_IFETCH_MPKI",
+        "CHI_L1D_LD_MPKI",
+        "CHI_L2_LD_MPKI",
+    )
+    rows = []
+    predictions = []
+    for workload_index, workload in enumerate(("w0", "w1", "w2")):
+        for index in range(3):
+            row = {"workload_id": workload, "region_id": f"{workload}_{index}", "config_id": f"c{index}"}
+            pred = dict(row)
+            for metric_index, metric in enumerate(metrics):
+                truth = float((workload_index + 1) * (index + 1) * (metric_index + 1))
+                row[f"label_{metric}"] = truth
+                pred[f"truth_{metric}"] = truth
+                pred[f"prediction_{metric}"] = truth * (1.0 + 0.1 * (workload_index + 1))
+            rows.append(row)
+            predictions.append(pred)
+    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
+    pd.DataFrame(predictions).to_parquet(ood / "oof_predictions.parquet", index=False)
+    ood_report = {
+        "task_id": "l1-surrogate",
+        "metrics": {
+            "macro_workload": {
+                metric: {"smape_pct": 10.0 + offset, "wape_pct": 11.0 + offset}
+                for offset, metric in enumerate(metrics)
+            },
+        },
+    }
+    (ood / "evaluation.json").write_text(json.dumps(ood_report), encoding="utf-8")
+    random_report = {
+        "task_id": "l1-surrogate",
+        "metrics": {
+            "roi_weighted": {
+                metric: {"smape_pct": 2.0 + offset, "wape_pct": 3.0 + offset}
+                for offset, metric in enumerate(metrics)
+            },
+        },
+    }
+    (random_roi / "evaluation.json").write_text(json.dumps(random_report), encoding="utf-8")
+
+    report = plot_l1_summary(
+        dataset_dir=dataset,
+        workload_ood_dir=ood,
+        random_roi_dir=random_roi,
+        output_dir=plots,
+    )
+    summary = json.loads(Path(report["summary"]).read_text(encoding="utf-8"))
+
+    assert summary["task_id"] == "l1-surrogate"
+    assert summary["metrics"] == list(metrics)
+    assert summary["protocol_errors"]["CPI"]["gap_smape_pct"] == 8.0
+    assert summary["workload_errors"]["CPI"]["w0"]["rows"] == 3
+    for path in summary["plots"].values():
+        assert Path(path).stat().st_size > 0
+
+
+def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    ood = tmp_path / "unified_ood"
+    plots = tmp_path / "plots"
+    dataset.mkdir()
+    ood.mkdir()
+    metrics = (
+        "CPI",
+        "BRANCH_MPKI",
+        "CHI_L1I_IFETCH_MPKI",
+        "CHI_L1D_LD_MPKI",
+        "CHI_L2_LD_MPKI",
+    )
+    row = {"workload_id": "w0", "region_id": "r0", "config_id": "c0"}
+    prediction = dict(row)
+    for metric in metrics:
+        row[f"label_{metric}"] = 1.0
+        prediction[f"truth_{metric}"] = 1.0
+        prediction[f"prediction_{metric}"] = 1.0
+    pd.DataFrame([row]).to_parquet(dataset / "samples.parquet", index=False)
+    pd.DataFrame([prediction]).to_parquet(ood / "oof_predictions.parquet", index=False)
+    (ood / "evaluation.json").write_text(json.dumps({
+        "task_id": "l1-surrogate",
+        "metrics": {
+            "macro_workload": {
+                metric: {"smape_pct": 0.0, "wape_pct": 0.0}
+                for metric in metrics
+            },
+        },
+    }), encoding="utf-8")
+
+    report = plot_l1_summary(
+        dataset_dir=dataset,
+        workload_ood_dir=ood,
+        random_roi_dir=tmp_path / "missing_random_roi",
+        output_dir=plots,
+    )
+
+    assert report["random_roi_available"] is False
+    assert report["protocol_errors"]["CPI"]["random_roi_smape_pct"] is None
+
+
+def test_l1_plot_summary_requires_workload_ood_artifacts(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    pd.DataFrame({
+        "label_CPI": [1.0],
+        "label_BRANCH_MPKI": [1.0],
+        "label_CHI_L1I_IFETCH_MPKI": [1.0],
+        "label_CHI_L1D_LD_MPKI": [1.0],
+        "label_CHI_L2_LD_MPKI": [1.0],
+    }).to_parquet(dataset / "samples.parquet", index=False)
+
+    with pytest.raises(FileNotFoundError, match="missing L1 workload-OOD artifacts"):
+        plot_l1_summary(
             dataset_dir=dataset,
-            output_dir=tmp_path / "model",
-            feature_columns=("f0",),
-            label_columns=("label_constant",),
-            output_metrics=("constant",),
+            workload_ood_dir=tmp_path / "missing_ood",
+            random_roi_dir=tmp_path / "missing_random_roi",
+            output_dir=tmp_path / "plots",
         )
 
 
@@ -265,4 +620,14 @@ def _training_config() -> PeregrineConfig:
             num_threads=1,
             early_stopping_patience=2,
         ),
+    )
+
+
+def _test_task(*, feature_columns: tuple[str, ...], label_columns: tuple[str, ...], output_metrics: tuple[str, ...]) -> PredictionTask:
+    return PredictionTask(
+        task_id="l1-test", identity_columns=("workload_id", "region_id", "config_id"),
+        group_column="workload_id", feature_set=FeatureSet("trace_design", feature_columns),
+        label_columns=label_columns, output_metrics=output_metrics,
+        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
+        num_threads=1, seed=7,
     )
