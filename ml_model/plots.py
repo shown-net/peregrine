@@ -16,64 +16,64 @@ from .dataset_io import read_dataset_shards
 from .tasks import L1_TASK_ID
 
 
-L1_CORE_METRICS = (
-    "CPI",
-    "BRANCH_MPKI",
-    "CHI_L1I_IFETCH_MPKI",
-    "CHI_L1D_LD_MPKI",
-    "CHI_L2_LD_MPKI",
-)
-
-
 def plot_l1_summary(
     *,
     dataset_dir: str | Path,
-    workload_ood_dir: str | Path,
+    config_generalization_dir: str | Path,
     random_roi_dir: str | Path,
     output_dir: str | Path,
-    metrics: tuple[str, ...] = L1_CORE_METRICS,
 ) -> dict[str, Any]:
     dataset_root = Path(dataset_dir)
-    ood_root = Path(workload_ood_dir)
+    generalization_root = Path(config_generalization_dir)
     random_root = Path(random_roi_dir)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
+    generalization_evaluation_path = generalization_root / "evaluation.json"
+    generalization_predictions_path = generalization_root / "oof_predictions.parquet"
+    if not generalization_evaluation_path.is_file() or not generalization_predictions_path.is_file():
+        raise FileNotFoundError(
+            "missing L1 held-out-configuration artifacts; run "
+            "`peregrine model evaluate --task l1-surrogate --protocol config-generalization "
+            "--dataset-dir <dataset> --output-dir <config_generalization_dir>`"
+        )
+    generalization_evaluation = _read_json(generalization_evaluation_path)
+    if (
+        generalization_evaluation.get("task_id") != L1_TASK_ID
+        or generalization_evaluation.get("generalization_scope") != "held_out_configuration"
+    ):
+        raise ValueError(f"configuration-generalization evaluation is not canonical L1: {generalization_evaluation_path}")
+    absolute = (generalization_evaluation.get("metrics") or {}).get("per_metric_absolute") or {}
+    metrics = tuple(absolute)
+    if not metrics:
+        raise ValueError("configuration-generalization evaluation has no configured metrics")
     labels = tuple(f"label_{metric}" for metric in metrics)
     label_frame = read_dataset_shards(dataset_root, columns=labels)
-    ood_evaluation_path = ood_root / "evaluation.json"
-    ood_predictions_path = ood_root / "oof_predictions.parquet"
-    if not ood_evaluation_path.is_file() or not ood_predictions_path.is_file():
-        raise FileNotFoundError(
-            "missing L1 workload-OOD artifacts; run "
-            "`peregrine model evaluate --task l1-surrogate --protocol workload-ood "
-            "--dataset-dir <dataset> --output-dir <workload_ood_dir>`"
-        )
-    ood_evaluation = _read_json(ood_evaluation_path)
-    if ood_evaluation.get("task_id") != L1_TASK_ID:
-        raise ValueError(f"workload-OOD evaluation is not L1: {ood_evaluation_path}")
-    ood_predictions = pd.read_parquet(ood_predictions_path)
-    _require_prediction_columns(ood_predictions, metrics)
+    generalization_predictions = pd.read_parquet(generalization_predictions_path)
+    _require_prediction_columns(generalization_predictions, metrics)
 
     random_evaluation_path = random_root / "evaluation.json"
     random_evaluation = _read_json(random_evaluation_path) if random_evaluation_path.is_file() else None
-    if random_evaluation is not None and random_evaluation.get("task_id") != L1_TASK_ID:
-        raise ValueError(f"random-ROI evaluation is not L1: {random_evaluation_path}")
+    if random_evaluation is not None and (
+        random_evaluation.get("task_id") != L1_TASK_ID
+        or random_evaluation.get("protocol") != "random_roi_split"
+    ):
+        raise ValueError(f"random-ROI evaluation is not an L1 in-distribution diagnostic: {random_evaluation_path}")
 
     label_plot = output / "l1_label_distributions.png"
     protocol_plot = output / "l1_generalization_protocol_errors.png"
     workload_plot = output / "l1_workload_error_points.png"
     _plot_label_distributions(label_frame, metrics, label_plot)
-    _plot_protocol_errors(ood_evaluation, random_evaluation, metrics, protocol_plot)
-    _plot_workload_error_points(ood_predictions, metrics, workload_plot)
+    _plot_protocol_errors(generalization_evaluation, random_evaluation, metrics, protocol_plot)
+    _plot_workload_error_points(generalization_predictions, metrics, workload_plot)
 
     report = {
         "task_id": L1_TASK_ID,
         "metrics": list(metrics),
         "artifact_inputs": {
             "dataset_dir": str(dataset_root),
-            "workload_ood_evaluation": str(ood_evaluation_path),
-            "workload_ood_predictions": str(ood_predictions_path),
+            "config_generalization_evaluation": str(generalization_evaluation_path),
+            "config_generalization_predictions": str(generalization_predictions_path),
             "random_roi_evaluation": str(random_evaluation_path) if random_evaluation else None,
         },
         "plots": {
@@ -85,11 +85,11 @@ def plot_l1_summary(
             metric: _distribution(label_frame[f"label_{metric}"].to_numpy(dtype=np.float64))
             for metric in metrics
         },
-        "protocol_errors": _protocol_summary(ood_evaluation, random_evaluation, metrics),
-        "workload_errors": _workload_summary(ood_predictions, metrics),
+        "protocol_errors": _protocol_summary(generalization_evaluation, random_evaluation, metrics),
+        "workload_errors": _workload_summary(generalization_predictions, metrics),
         "rows": {
             "dataset": int(len(label_frame)),
-            "workload_ood": int(len(ood_predictions)),
+            "config_generalization": int(len(generalization_predictions)),
         },
         "random_roi_available": random_evaluation is not None,
     }
@@ -160,23 +160,23 @@ def _metric_report(evaluation: dict[str, Any] | None, aggregation: str, metric: 
 
 
 def _protocol_summary(
-    ood_evaluation: dict[str, Any],
+    generalization_evaluation: dict[str, Any],
     random_evaluation: dict[str, Any] | None,
     metrics: tuple[str, ...],
 ) -> dict[str, dict[str, float | None]]:
     summary: dict[str, dict[str, float | None]] = {}
     for metric in metrics:
-        ood = _metric_report(ood_evaluation, "macro_workload", metric)
+        generalization = _metric_report(generalization_evaluation, "per_metric_absolute", metric)
         random = _metric_report(random_evaluation, "roi_weighted", metric)
-        if ood is None:
-            raise ValueError(f"workload-OOD evaluation lacks macro_workload metric: {metric}")
-        ood_value = float(ood["smape_pct"])
+        if generalization is None:
+            raise ValueError(f"configuration-generalization evaluation lacks metric: {metric}")
+        generalization_value = float(generalization["smape_pct"])
         random_value = None if random is None else float(random["smape_pct"])
         summary[metric] = {
-            "workload_ood_smape_pct": ood_value,
+            "config_generalization_smape_pct": generalization_value,
             "random_roi_smape_pct": random_value,
-            "gap_smape_pct": None if random_value is None else ood_value - random_value,
-            "workload_ood_wape_pct": float(ood["wape_pct"]),
+            "gap_smape_pct": None if random_value is None else generalization_value - random_value,
+            "config_generalization_wape_pct": float(generalization["wape_pct"]),
             "random_roi_wape_pct": None if random is None else float(random["wape_pct"]),
         }
     return summary
@@ -227,24 +227,24 @@ def _plot_label_distributions(frame: pd.DataFrame, metrics: tuple[str, ...], pat
 
 
 def _plot_protocol_errors(
-    ood_evaluation: dict[str, Any],
+    generalization_evaluation: dict[str, Any],
     random_evaluation: dict[str, Any] | None,
     metrics: tuple[str, ...],
     path: Path,
 ) -> None:
     x = np.arange(len(metrics))
     width = 0.34 if random_evaluation else 0.5
-    ood = [float(_metric_report(ood_evaluation, "macro_workload", metric)["smape_pct"]) for metric in metrics]
+    generalization = [float(_metric_report(generalization_evaluation, "per_metric_absolute", metric)["smape_pct"]) for metric in metrics]
     random = [
         None if random_evaluation is None else float(_metric_report(random_evaluation, "roi_weighted", metric)["smape_pct"])
         for metric in metrics
     ]
     figure, axis = plt.subplots(figsize=(max(9, len(metrics) * 1.8), 5.2))
-    axis.bar(x - (width / 2 if random_evaluation else 0), ood, width, label="workload-OOD macro", color="#4C78A8")
+    axis.bar(x - (width / 2 if random_evaluation else 0), generalization, width, label="held-out configuration", color="#4C78A8")
     if random_evaluation:
         axis.bar(x + width / 2, random, width, label="random-ROI test", color="#F58518")
-        for idx, (ood_value, random_value) in enumerate(zip(ood, random, strict=True)):
-            axis.plot([idx - width / 2, idx + width / 2], [ood_value, random_value], color="#666666", linewidth=0.9, alpha=0.5)
+        for idx, (generalization_value, random_value) in enumerate(zip(generalization, random, strict=True)):
+            axis.plot([idx - width / 2, idx + width / 2], [generalization_value, random_value], color="#666666", linewidth=0.9, alpha=0.5)
     axis.set_xticks(x)
     axis.set_xticklabels(metrics, rotation=25, ha="right")
     axis.set_ylabel("SMAPE%")

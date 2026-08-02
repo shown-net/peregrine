@@ -7,7 +7,7 @@ from pathlib import Path
 
 from anamol.python.design_space import load_peregrine_config
 from anamol.python.microarchitecture import load_microarchitecture_config
-from anamol.python.dataset import build_dataset_shards
+from anamol.python.dataset import build_full_roi_window_dataset_shards
 from ml_model.inference import PredictorBundle
 from ml_model.inference import predict_bundle_parquet
 from ml_model.plots import plot_l1_summary
@@ -39,13 +39,14 @@ def _dataset_build(args: argparse.Namespace) -> int:
             raw_root=args.raw_root, metrics_config=args.metrics_config,
             output_dir=args.output_dir, workload_ids=tuple(args.workload_id or ()) or None,
         ))
+    if args.manifest is not None:
+        raise ValueError("l1-surrogate full-ROI dataset build does not accept --manifest")
     config = load_peregrine_config(args.config, metrics_config=args.metrics_config, microarchitecture=load_microarchitecture_config(args.microarchitecture_config))
-    report = build_dataset_shards(
+    report = build_full_roi_window_dataset_shards(
         config=config,
         raw_root=args.raw_root,
         output_dir=args.output_dir,
         workload_ids=tuple(args.workload_id or ()) or None,
-        manifest_path=args.manifest,
         workers=args.workers,
     )
     return _print_json(report)
@@ -63,12 +64,19 @@ def _model_predict(args: argparse.Namespace) -> int:
 
 
 def _model_evaluate(args: argparse.Namespace) -> int:
-    evaluate = (
-        evaluate_prediction_task
-        if args.protocol == "workload-ood" else evaluate_random_roi_split_prediction_task
+    task = _task_from_args(args)
+    valid_protocol = (
+        (task.task_id == L1_TASK_ID and args.protocol == "config-generalization")
+        or (task.task_id == L3_TASK_ID and args.protocol == "workload-ood")
     )
+    if args.protocol == "random-roi" and task.task_id == L1_TASK_ID:
+        evaluate = evaluate_random_roi_split_prediction_task
+    elif valid_protocol:
+        evaluate = evaluate_prediction_task
+    else:
+        raise ValueError(f"protocol {args.protocol} does not apply to task {task.task_id}")
     return _print_json(evaluate(
-        task=_task_from_args(args), dataset_dir=args.dataset_dir, output_dir=args.output_dir,
+        task=task, dataset_dir=args.dataset_dir, output_dir=args.output_dir,
         workload_ids=tuple(args.workload_id or ()) or None,
     ))
 
@@ -76,7 +84,7 @@ def _model_evaluate(args: argparse.Namespace) -> int:
 def _plot_l1_summary(args: argparse.Namespace) -> int:
     return _print_json(plot_l1_summary(
         dataset_dir=args.dataset_dir,
-        workload_ood_dir=args.workload_ood_dir,
+        config_generalization_dir=args.config_generalization_dir,
         random_roi_dir=args.random_roi_dir,
         output_dir=args.output_dir,
     ))
@@ -170,14 +178,18 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--dataset-dir", required=True)
     evaluate.add_argument("--output-dir", default=str(DEFAULT_EVALUATION_DIR))
     evaluate.add_argument("--workload-id", action="append", default=[])
-    evaluate.add_argument("--protocol", choices=("workload-ood", "random-roi"), default="workload-ood")
+    evaluate.add_argument(
+        "--protocol",
+        choices=("config-generalization", "workload-ood", "random-roi"),
+        required=True,
+    )
     evaluate.set_defaults(func=_model_evaluate)
 
     plot = sub.add_parser("plot")
     plot_sub = plot.add_subparsers(dest="action", required=True)
     l1_summary = plot_sub.add_parser("l1-summary")
     l1_summary.add_argument("--dataset-dir", default=str(DEFAULT_DATASET_DIR))
-    l1_summary.add_argument("--workload-ood-dir", default=str(DEFAULT_OUTPUT_ROOT / "unified_ood"))
+    l1_summary.add_argument("--config-generalization-dir", default=str(DEFAULT_EVALUATION_DIR))
     l1_summary.add_argument("--random-roi-dir", default=str(DEFAULT_EVALUATION_DIR))
     l1_summary.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "plots_l1"))
     l1_summary.set_defaults(func=_plot_l1_summary)
