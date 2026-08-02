@@ -214,6 +214,37 @@ PreparedTrace prepare_trace(const std::vector<Instr>& instrs, int window_size) {
   return prepared;
 }
 
+PreparedTrace prepare_trace_range(
+    const std::vector<Instr>& instrs,
+    size_t range_start,
+    size_t range_end,
+    int window_size) {
+  if (range_start > range_end || range_end > instrs.size())
+    throw std::runtime_error("invalid Anamol trace window range");
+  PreparedTrace prepared;
+  const size_t step = static_cast<size_t>(window_size);
+  const size_t count = range_end - range_start;
+  const size_t num_windows = (count + step - 1) / step;
+  prepared.windows.reserve(num_windows);
+  prepared.counts.reserve(num_windows);
+  for (size_t start = range_start; start < range_end; start += step) {
+    const size_t end = std::min(start + step, range_end);
+    WindowCounts counts;
+    for (size_t index = start; index < end; ++index) {
+      const auto& instr = instrs[index];
+      counts.int_alu += instr.is_alu;
+      counts.int_mult_div += instr.is_alu_mult_div;
+      counts.fp += instr.is_fp;
+      counts.fp_mult_div += instr.is_fp_mult_div;
+      counts.load += instr.is_load;
+      counts.store += instr.is_store;
+    }
+    prepared.windows.push_back({start, end});
+    prepared.counts.push_back(counts);
+  }
+  return prepared;
+}
+
 double count_bound(size_t window_size, uint32_t count, uint16_t width) {
   if (count == 0)
     return static_cast<double>(window_size);
@@ -607,6 +638,74 @@ std::vector<double> analyze_trace(
       auto features = distribution_features(component_samples(
           prepared, active_trace, mechanisms[mechanism_index], config));
       matrix.insert(matrix.end(), features.begin(), features.end());
+    }
+  }
+  return matrix;
+}
+
+std::vector<double> analyze_trace_windows(
+    const std::vector<Instr>& instrs,
+    int full_roi_window_size,
+    int analysis_window_size,
+    size_t requested_window_count,
+    const std::vector<ConfigValues>& configs,
+    const std::vector<MechanismBinding>& mechanisms) {
+  if (instrs.empty())
+    throw std::runtime_error("Anamol trace contains no instructions");
+  if (full_roi_window_size <= 0)
+    throw std::runtime_error("Anamol full-ROI window size must be positive");
+  if (analysis_window_size <= 0)
+    throw std::runtime_error("Anamol analysis window size must be positive");
+  if (configs.empty())
+    throw std::runtime_error("Anamol configs must not be empty");
+  if (mechanisms.empty())
+    throw std::runtime_error("Anamol mechanisms must not be empty");
+
+  bool annotate = false;
+  for (const auto& binding : mechanisms) {
+    annotate = annotate || model_spec(binding).requires_cache_annotation;
+  }
+  const size_t feature_columns = feature_count(mechanisms);
+  const size_t full_step = static_cast<size_t>(full_roi_window_size);
+  const size_t available_window_count = instrs.size() / full_step;
+  const size_t window_count = requested_window_count;
+  if (window_count == 0)
+    throw std::runtime_error("Anamol trace has no complete full-ROI windows");
+  if (window_count > available_window_count)
+    throw std::runtime_error("Anamol requested more full-ROI windows than the trace contains");
+
+  std::vector<double> matrix;
+  matrix.resize(window_count * configs.size() * feature_columns);
+  std::vector<PreparedTrace> prepared_windows;
+  prepared_windows.reserve(window_count);
+  for (size_t full_window = 0; full_window < window_count; ++full_window) {
+    const size_t start = full_window * full_step;
+    prepared_windows.push_back(
+        prepare_trace_range(instrs, start, start + full_step, analysis_window_size));
+  }
+
+  #pragma omp parallel for schedule(dynamic)
+  for (size_t config_index = 0; config_index < configs.size(); ++config_index) {
+    const auto& config = configs[config_index];
+    const size_t config_offset = config_index * window_count * feature_columns;
+    const LatencyOverlay* active_overlay = nullptr;
+    LatencyOverlay overlay;
+    if (annotate) {
+      overlay = annotate_cache_latencies(instrs, config);
+      active_overlay = &overlay;
+    }
+    const ActiveTrace active_trace{instrs, active_overlay};
+    size_t write_offset = config_offset;
+    for (size_t full_window = 0; full_window < window_count; ++full_window) {
+      const PreparedTrace& prepared = prepared_windows[full_window];
+      for (size_t mechanism_index = 0; mechanism_index < mechanisms.size();
+           ++mechanism_index) {
+        validate_binding_params(mechanisms[mechanism_index], config);
+        auto features = distribution_features(component_samples(
+            prepared, active_trace, mechanisms[mechanism_index], config));
+        std::copy(features.begin(), features.end(), matrix.begin() + write_offset);
+        write_offset += features.size();
+      }
     }
   }
   return matrix;

@@ -26,6 +26,14 @@ std::vector<double> analyze_trace(
     const std::vector<ConfigValues>& configs,
     const std::vector<MechanismBinding>& mechanisms);
 
+std::vector<double> analyze_trace_windows(
+    const std::vector<Instr>& instrs,
+    int full_roi_window_size,
+    int analysis_window_size,
+    size_t window_count,
+    const std::vector<ConfigValues>& configs,
+    const std::vector<MechanismBinding>& mechanisms);
+
 }  // namespace analytical
 
 #endif  // ANALYSIS_ENGINE_H

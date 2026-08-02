@@ -16,6 +16,7 @@ from .formula import formula_name
 @dataclass(frozen=True)
 class TraceLabel:
     metric_id: str
+    role: str
     stats: tuple[str, ...]
     formula: str
     formula_inputs: tuple[tuple[str, str], ...]
@@ -68,6 +69,7 @@ def label_registry_from_metrics(metrics: Any, *, metric_set_id: str) -> TraceLab
         labels.append(
             TraceLabel(
                 metric_id=metric_id,
+                role=str(node["role"]),
                 stats=tuple(str(stat) for stat in gem5["stats"]),
                 formula=str(gem5["formula"]),
                 formula_inputs=formula_inputs,

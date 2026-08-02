@@ -75,6 +75,48 @@ def iter_anamol_feature_batches(
     yield FeatureBatch(values=values)
 
 
+def analyze_full_roi_windows(
+    *,
+    trace_path: str | Path,
+    configs: tuple[Mapping[str, int | float | str], ...],
+    full_roi_window_size: int,
+    analysis_window_size: int,
+    window_count: int,
+    mechanisms: tuple[ComponentDef, ...],
+) -> np.ndarray:
+    if not configs:
+        raise ValueError("Anamol configs must not be empty")
+    if full_roi_window_size <= 0:
+        raise ValueError("full-ROI window size must be positive")
+    if analysis_window_size <= 0:
+        raise ValueError("analysis window size must be positive")
+    if window_count <= 0:
+        raise ValueError("full-ROI window count must be positive")
+    trace = Path(trace_path).resolve()
+    if trace.suffixes[-2:] != [".pb", ".zst"]:
+        raise ValueError(f"Anamol requires a protobuf trace: {trace}")
+    bindings = list(mechanism_bindings(mechanisms))
+    module = _analysis_module()
+    expected_columns = len(analytical_feature_columns(mechanisms))
+    if int(module.feature_count_for_bindings(bindings)) != expected_columns:
+        raise ValueError("Anamol extension feature count differs from configured columns")
+    values = module.analyze_trace_windows(
+        str(trace),
+        int(full_roi_window_size),
+        int(analysis_window_size),
+        int(window_count),
+        [dict(config) for config in configs],
+        bindings,
+    )
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 3 or values.shape[0] != len(configs) or values.shape[2] != expected_columns:
+        raise ValueError("Anamol window feature tensor dimensions differ from the configured contract")
+    values = np.transpose(values, (1, 0, 2))
+    if not np.isfinite(values).all():
+        raise ValueError("Anamol window feature tensor contains non-finite features")
+    return values
+
+
 def _analysis_module():
     try:
         from anamol import _analysis

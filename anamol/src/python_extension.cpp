@@ -94,4 +94,31 @@ PYBIND11_MODULE(_analysis, module) {
         std::copy(flat.begin(), flat.end(), output.mutable_data());
         return output;
       });
+
+  module.def(
+      "analyze_trace_windows",
+      [](const std::string& trace_path, int full_roi_window_size,
+         int analysis_window_size, size_t window_count, const py::list& configs,
+         const py::list& mechanisms) {
+        auto rows = parse_configs(configs);
+        auto bindings = parse_mechanisms(mechanisms);
+        std::vector<analytical::Instr> parsed;
+        std::vector<double> flat;
+        {
+          py::gil_scoped_release release;
+          parsed = parse_single_region(trace_path);
+          flat = analytical::analyze_trace_windows(
+              parsed, full_roi_window_size, analysis_window_size, window_count, rows,
+              bindings);
+        }
+        const size_t column_count = analytical::feature_count(bindings);
+        const size_t config_count = rows.size();
+        if (config_count == 0 || column_count == 0 ||
+            flat.size() % (config_count * column_count) != 0)
+          throw std::runtime_error("invalid Anamol window feature dimensions");
+        const size_t actual_window_count = flat.size() / (config_count * column_count);
+        py::array_t<double> output({config_count, actual_window_count, column_count});
+        std::copy(flat.begin(), flat.end(), output.mutable_data());
+        return output;
+      });
 }

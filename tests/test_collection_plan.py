@@ -154,6 +154,23 @@ def test_analysis_extension_reports_configured_feature_count() -> None:
     )
 
 
+def test_window_feature_api_rejects_invalid_full_roi_window_size(tmp_path: Path) -> None:
+    from anamol.python.feature_pipeline import analyze_full_roi_windows
+
+    config = load_test_config()
+    trace = _minimal_trace_path(tmp_path)
+
+    with pytest.raises(ValueError, match="full-ROI window size"):
+        analyze_full_roi_windows(
+            trace_path=trace,
+            configs=(_cache_config(),),
+            full_roi_window_size=0,
+            analysis_window_size=400,
+            window_count=1,
+            mechanisms=config.microarchitecture.mechanisms,
+        )
+
+
 def test_anamol_binding_carries_canonical_cache_geometry() -> None:
     config = load_test_config()
     run = sample_run_configs(config=config, count=1, seed=1)[0]
@@ -300,7 +317,7 @@ def test_width_and_load_store_port_components_use_canonical_parameters(tmp_path:
     assert values[0, ls_mean] != values[1, ls_mean]
 
 
-def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeypatch) -> None:
+def test_l1_dataset_build_cli_uses_full_roi_window_builder(tmp_path: Path, monkeypatch) -> None:
     calls = []
     sentinel_config = object()
     sentinel_microarchitecture = object()
@@ -312,7 +329,7 @@ def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeyp
     )
     monkeypatch.setattr(
         peregrine_cli,
-        "build_dataset_shards",
+        "build_full_roi_window_dataset_shards",
         lambda **kwargs: calls.append(kwargs) or {"dataset": str(tmp_path / "dataset"), "shards": [], "workloads": []},
     )
     args = peregrine_cli.build_parser().parse_args(
@@ -327,8 +344,6 @@ def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeyp
             "micro.yaml",
             "--raw-root",
             str(tmp_path / "raw"),
-            "--manifest",
-            str(tmp_path / "raw" / "manifest.json"),
             "--output-dir",
             str(tmp_path / "dataset"),
         ]
@@ -336,7 +351,33 @@ def test_dataset_build_cli_passes_explicit_manifest_path(tmp_path: Path, monkeyp
 
     assert peregrine_cli._dataset_build(args) == 0
 
-    assert calls[0]["manifest_path"] == tmp_path / "raw" / "manifest.json"
+    assert calls[0]["config"] is sentinel_config
+    assert calls[0]["raw_root"] == str(tmp_path / "raw")
+    assert calls[0]["output_dir"] == str(tmp_path / "dataset")
+
+
+def test_l1_dataset_build_cli_rejects_sampling_manifest(tmp_path: Path) -> None:
+    args = peregrine_cli.build_parser().parse_args(
+        [
+            "dataset",
+            "build",
+            "--task",
+            "l1-surrogate",
+            "--metrics-config",
+            "metrics.yaml",
+            "--microarchitecture-config",
+            "micro.yaml",
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--manifest",
+            str(tmp_path / "raw" / "manifest.json"),
+            "--output-dir",
+            str(tmp_path / "dataset"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="does not accept --manifest"):
+        peregrine_cli._dataset_build(args)
 
 
 def test_peregrine_cli_uses_owned_default_output_paths(tmp_path: Path, monkeypatch) -> None:
@@ -351,7 +392,7 @@ def test_peregrine_cli_uses_owned_default_output_paths(tmp_path: Path, monkeypat
     )
     monkeypatch.setattr(
         peregrine_cli,
-        "build_dataset_shards",
+        "build_full_roi_window_dataset_shards",
         lambda **kwargs: calls.append(("dataset", kwargs)) or {"dataset": kwargs["output_dir"], "shards": [], "workloads": []},
     )
     monkeypatch.setattr(
@@ -415,7 +456,7 @@ def test_peregrine_cli_explicit_paths_override_owned_defaults(tmp_path: Path, mo
 
 def test_peregrine_cli_uses_owned_default_evaluation_path(tmp_path: Path, monkeypatch) -> None:
     calls = []
-    sentinel_config = object()
+    sentinel_config = type("Task", (), {"task_id": "l3-real-anchor"})()
     sentinel_microarchitecture = object()
     monkeypatch.setattr(peregrine_cli, "load_microarchitecture_config", lambda _path: sentinel_microarchitecture)
     monkeypatch.setattr(
@@ -433,6 +474,7 @@ def test_peregrine_cli_uses_owned_default_evaluation_path(tmp_path: Path, monkey
     assert peregrine_cli.main([
         "model", "evaluate",
         "--task", "l3-real-anchor",
+        "--protocol", "workload-ood",
         "--metrics-config", "metrics.yaml",
         "--microarchitecture-config", "micro.yaml",
         "--dataset-dir", str(tmp_path / "dataset"),
@@ -495,6 +537,67 @@ def test_dataset_build_uses_final_raw_samples_and_parallel_trace_groups(tmp_path
     assert calls == [(trace_root / dataset_module.TRACE_FILE, 3)]
     assert report["shards"] == ["work.parquet"]
     assert report["workloads"] == [{"workload_id": "work", "rows": 3, "skipped": 0}]
+
+
+def test_full_roi_window_dataset_build_uses_window_config_identities(tmp_path: Path, monkeypatch) -> None:
+    config = load_test_config()
+    raw = tmp_path / "raw"
+    configs_root = raw / "workloads" / "work" / "configs"
+    baseline = configs_root / "baseline"
+    candidate = configs_root / "fetch_width_6_aaaaaaaaaaaaaaaa"
+    baseline.mkdir(parents=True)
+    candidate.mkdir(parents=True)
+    (baseline / dataset_module.TRACE_FILE).write_bytes(b"trace")
+    (baseline / "stats.h5").write_bytes(b"baseline")
+    (candidate / "stats.h5").write_bytes(b"candidate")
+    candidate_args = config.microarchitecture.gem5_args({"fetch_width": 6})
+    (candidate / "run.log").write_text(
+        "command line: gem5 " + " ".join(candidate_args) + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_read_label_values(path, registry):
+        import numpy as np
+
+        base = 1.0 if Path(path).parent.name == "baseline" else 10.0
+        return np.asarray(
+            [
+                [base + window + label for label in range(len(config.label_columns))]
+                for window in range(3)
+            ],
+            dtype=np.float64,
+        )
+
+    def fake_analyze_full_roi_windows(*, configs, mechanisms, window_count, **_kwargs):
+        import numpy as np
+
+        columns = len(analytical_feature_columns(mechanisms))
+        values = np.zeros((window_count, len(configs), columns), dtype=np.float64)
+        for window in range(window_count):
+            for config_index in range(len(configs)):
+                values[window, config_index, :] = window * 100 + config_index
+        return values
+
+    monkeypatch.setattr(dataset_module, "read_label_values", fake_read_label_values)
+    monkeypatch.setattr(dataset_module, "analyze_full_roi_windows", fake_analyze_full_roi_windows)
+
+    report = dataset_module.build_full_roi_window_dataset_shards(
+        config=config,
+        raw_root=raw,
+        output_dir=tmp_path / "dataset",
+        workload_ids=("work",),
+        workers=1,
+    )
+
+    frame = pq.read_table(tmp_path / "dataset" / "work.parquet").to_pandas()
+    assert report["workloads"] == [{"workload_id": "work", "rows": 6, "configs": 2, "windows": 3}]
+    assert "region_id" not in frame.columns
+    assert frame[["workload_id", "window_index", "config_id"]].to_dict("records") == [
+        {"workload_id": "work", "window_index": window, "config_id": config_id}
+        for window in range(3)
+        for config_id in ("baseline", "fetch_width_6_aaaaaaaaaaaaaaaa")
+    ]
+    assert frame["label_CPI"].tolist() == [1.0, 10.0, 2.0, 11.0, 3.0, 12.0]
 
 
 def test_dataset_build_consumes_sampling_manifest_and_ignores_stale_raw_samples(tmp_path: Path, monkeypatch) -> None:

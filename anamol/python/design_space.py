@@ -31,6 +31,12 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class EvaluationConfig:
+    config_folds: int
+    top_k: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class CollectionSamplingConfig:
     seed: int
     configs_per_region: int
@@ -43,6 +49,7 @@ class PeregrineConfig:
     collection_sampling: CollectionSamplingConfig
     labels: TraceLabelRegistry
     training: TrainingConfig
+    evaluation: EvaluationConfig
 
     @property
     def design_parameter_names(self) -> tuple[str, ...]:
@@ -102,6 +109,9 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
     training = payload.get("training")
     if not isinstance(training, dict):
         raise ValueError("Peregrine config must define training")
+    evaluation = payload.get("evaluation")
+    if not isinstance(evaluation, dict):
+        raise ValueError("Peregrine config must define evaluation")
     hidden_dims = tuple(int(value) for value in training["hidden_dims"])
     if len(hidden_dims) != 2:
         raise ValueError("training.hidden_dims must contain two values")
@@ -129,6 +139,10 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
             num_threads=None if num_threads is None else int(num_threads),
             early_stopping_patience=int(training["early_stopping_patience"]),
         ),
+        evaluation=EvaluationConfig(
+            config_folds=int(evaluation["config_folds"]),
+            top_k=tuple(int(value) for value in evaluation["top_k"]),
+        ),
     )
     _validate_config(config)
     return config
@@ -149,6 +163,10 @@ def _validate_config(config: PeregrineConfig) -> None:
         raise ValueError("training.early_stopping_patience must be positive")
     if config.training.weight_decay < 0.0:
         raise ValueError("training.weight_decay must not be negative")
+    if config.evaluation.config_folds < 3:
+        raise ValueError("evaluation.config_folds must be at least three")
+    if not config.evaluation.top_k or any(value < 1 for value in config.evaluation.top_k):
+        raise ValueError("evaluation.top_k must contain positive values")
     for name, value in (("paper_test_fraction", config.training.paper_test_fraction),):
         if not 0.0 < value < 1.0:
             raise ValueError(f"training.{name} must be between zero and one")
