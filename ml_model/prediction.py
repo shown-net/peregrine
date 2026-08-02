@@ -1,8 +1,9 @@
-"""Canonical fixed-model training and workload OOD evaluation."""
+"""Canonical fixed-model training and leakage-free grouped evaluation."""
 
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -42,6 +43,7 @@ class PredictionTask:
     training: MultiHeadTraining
     num_threads: int
     seed: int
+    evaluation_folds: int = 5
     data_limitations: tuple[str, ...] = ()
 
 
@@ -54,9 +56,12 @@ def train_prediction_task(
     truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
     features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    models = output / "models"
-    models.mkdir(exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_name(f".{output.name}.partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir()
+    models = partial / "models"
+    models.mkdir()
     selected: dict[str, dict[str, object]] = {}
     paths: dict[str, str] = {}
     for index, metric in enumerate(task.output_metrics):
@@ -72,42 +77,76 @@ def train_prediction_task(
             "candidate_id": candidate_id, "predictor_kind": "singlehead",
             "feature_set": task.feature_set.feature_set_id,
         }
-        paths[candidate_id] = str(path.relative_to(output))
+        paths[candidate_id] = str(path.relative_to(partial))
     report = {
         "task_id": task.task_id,
         "protocol": "full_dataset_deployment_training",
         "samples": len(frame),
-        "workloads": int(frame[task.group_column].nunique()),
+        "workloads": int(frame["workload_id"].nunique()) if "workload_id" in frame else 0,
+        "configurations": int(frame["config_id"].nunique()) if "config_id" in frame else 0,
         "selected": selected,
     }
-    training_report = output / "training_report.json"
+    training_report = partial / "training_report.json"
     training_report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    bundle = output / "predictor_bundle.json"
+    bundle = partial / "predictor_bundle.json"
     bundle.write_text(json.dumps({
         "task_id": task.task_id, "identity_columns": task.identity_columns,
         "output_metrics": task.output_metrics, "selected": selected, "model_paths": paths,
     }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {"bundle": str(bundle), "training_report": str(training_report)}
+    from .inference import PredictorBundle
+
+    PredictorBundle(bundle, num_threads=task.num_threads)
+    previous = output.with_name(f".{output.name}.previous")
+    if previous.exists():
+        raise RuntimeError(f"previous deployment model directory exists: {previous}")
+    if output.exists():
+        output.replace(previous)
+    try:
+        partial.replace(output)
+    except BaseException:
+        if previous.exists():
+            previous.replace(output)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
+    return {
+        "bundle": str(output / bundle.name),
+        "training_report": str(output / training_report.name),
+    }
 
 
 def evaluate_prediction_task(
     *, task: PredictionTask, dataset_dir: str | Path, output_dir: str | Path,
     workload_ids: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    """Evaluate fixed scalar models with leave-one-workload-out isolation."""
+    """Evaluate fixed scalar models with whole-group train/validation/test isolation."""
     frame = _read_task_frame(task, dataset_dir, workload_ids)
     values = frame[task.group_column].astype(str).to_numpy()
     groups = tuple(sorted(set(values)))
-    if len(groups) < 3:
-        raise ValueError("workload OOD requires at least three groups")
+    baseline_rows = (
+        frame["config_id"].astype(str).to_numpy() == "baseline"
+        if task.group_column == "config_id" and "config_id" in frame
+        else np.zeros(len(frame), dtype=bool)
+    )
+    evaluation_groups = tuple(group for group in groups if group != "baseline")
+    fold_count = task.evaluation_folds if task.group_column == "config_id" else len(groups)
+    if len(evaluation_groups) < fold_count:
+        raise ValueError("grouped evaluation has fewer groups than folds")
     truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
     features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
     prediction = np.empty_like(truth)
+    delta_truth_by_row = np.full_like(truth, np.nan)
+    delta_prediction_by_row = np.full_like(truth, np.nan)
+    evaluated = np.zeros(len(frame), dtype=bool)
     folds: list[dict[str, object]] = []
-    for offset, heldout in enumerate(groups):
-        test = values == heldout
-        valid = _validation_mask(values, test, task.seed + offset)
+    fold_groups = _group_folds(evaluation_groups, fold_count, task.seed)
+    delta_truth: list[np.ndarray] = []
+    delta_prediction: list[np.ndarray] = []
+    for offset, heldout in enumerate(fold_groups):
+        validation_groups = fold_groups[(offset + 1) % len(fold_groups)]
+        test = np.isin(values, heldout)
+        valid = np.isin(values, validation_groups)
         train = ~(test | valid)
+        evaluated |= test
         metric_epochs: dict[str, int] = {}
         for index, metric in enumerate(task.output_metrics):
             fitted = fit_multihead(
@@ -117,35 +156,85 @@ def evaluate_prediction_task(
                 label_columns=(task.label_columns[index],),
             )
             prediction[test, index] = predict_multihead(fitted, features[test])[:, 0]
+            if baseline_rows.any():
+                baseline_prediction = predict_multihead(fitted, features[baseline_rows])[:, 0]
+                fold_truth, fold_prediction = _candidate_baseline_deltas(
+                    frame=frame, metric_index=index, truth=truth,
+                    candidate_prediction=prediction[test, index], candidate_mask=test,
+                    baseline_prediction=baseline_prediction,
+                )
+                delta_truth.append(np.column_stack((np.full(len(fold_truth), index), fold_truth)))
+                delta_prediction.append(np.column_stack((np.full(len(fold_prediction), index), fold_prediction)))
+                delta_truth_by_row[test, index] = fold_truth
+                delta_prediction_by_row[test, index] = fold_prediction
             metric_epochs[metric] = fitted.epochs
         folds.append({
-            "heldout_workload": heldout,
-            "training_workloads": tuple(group for group in groups if group != heldout),
+            "heldout_groups": heldout,
+            "validation_groups": validation_groups,
             "train_rows": int(train.sum()), "validation_rows": int(valid.sum()),
             "test_rows": int(test.sum()), "epochs": metric_epochs,
         })
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    destination = Path(output_dir)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output = destination.with_name(f".{destination.name}.partial")
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir()
     oof_path = output / "oof_predictions.parquet"
-    _write_predictions(frame, task, truth, prediction, oof_path)
+    evaluated_frame = frame.loc[evaluated]
+    evaluated_truth = truth[evaluated]
+    evaluated_prediction = prediction[evaluated]
+    _write_predictions(
+        evaluated_frame,
+        task,
+        evaluated_truth,
+        evaluated_prediction,
+        oof_path,
+        delta_truth=delta_truth_by_row[evaluated] if baseline_rows.any() else None,
+        delta_prediction=delta_prediction_by_row[evaluated] if baseline_rows.any() else None,
+    )
+    if task.group_column == "config_id":
+        metric_report = {
+            "roi_weighted": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
+            "per_metric_absolute": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
+            "candidate_minus_baseline_delta": _delta_report(task, delta_truth, delta_prediction),
+        }
+        primary_metric = _primary_metric("roi_weighted")
+    else:
+        metric_report = {
+            "roi_weighted": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
+            "macro_workload": _macro_workload_report(task, values[evaluated], evaluated_truth, evaluated_prediction),
+            "per_workload": _per_workload_report(task, values[evaluated], evaluated_truth, evaluated_prediction),
+        }
+        primary_metric = _primary_metric("macro_workload")
     report = {
         "task_id": task.task_id,
-        "protocol": "leave_one_workload_out",
-        "generalization_scope": "joint_program_microarchitecture_ood",
-        "primary_metric": _primary_metric("macro_workload"),
-        "samples": len(frame), "workloads": len(groups),
+        "protocol": "grouped_config_kfold" if task.group_column == "config_id" else "leave_one_workload_out",
+        "generalization_scope": "held_out_configuration" if task.group_column == "config_id" else "joint_program_microarchitecture_ood",
+        "primary_metric": primary_metric,
+        "samples": int(evaluated.sum()), "groups": len(evaluation_groups),
         "data_limitations": task.data_limitations,
-        "metrics": {
-            "roi_weighted": regression_error_report(task.label_columns, truth, prediction),
-            "macro_workload": _macro_workload_report(task, values, truth, prediction),
-            "per_workload": _per_workload_report(task, values, truth, prediction),
-        },
+        "metrics": metric_report,
         "outer_folds": folds,
-        "oof_predictions": str(oof_path),
+        "oof_predictions": str(destination / oof_path.name),
     }
     evaluation = output / "evaluation.json"
     evaluation.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {"evaluation": str(evaluation), "oof_predictions": str(oof_path)}
+    previous = destination.with_name(f".{destination.name}.previous")
+    if previous.exists():
+        raise RuntimeError(f"previous evaluation directory exists: {previous}")
+    if destination.exists():
+        destination.replace(previous)
+    try:
+        output.replace(destination)
+    except BaseException:
+        if previous.exists():
+            previous.replace(destination)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
+    return {
+        "evaluation": str(destination / evaluation.name),
+        "oof_predictions": str(destination / oof_path.name),
+    }
 
 
 def evaluate_random_roi_split_prediction_task(
@@ -204,14 +293,38 @@ def _read_task_frame(task, dataset_dir, workload_ids):
     return frame
 
 
-def _validation_mask(values, test, seed):
-    valid = np.zeros(len(values), dtype=bool)
-    for offset, workload in enumerate(sorted(set(values[~test]))):
-        rows = np.flatnonzero((values == workload) & ~test)
-        count = max(1, int(round(len(rows) * VALIDATION_FRACTION)))
-        rng = np.random.default_rng(seed + offset)
-        valid[rng.permutation(rows)[:count]] = True
-    return valid
+def _group_folds(groups, count, seed):
+    shuffled = np.asarray(groups, dtype=object)[np.random.default_rng(seed).permutation(len(groups))]
+    return tuple(tuple(str(item) for item in fold) for fold in np.array_split(shuffled, count))
+
+
+def _candidate_baseline_deltas(*, frame, metric_index, truth, candidate_prediction, candidate_mask, baseline_prediction):
+    keys = [name for name in ("workload_id", "window_index") if name in frame]
+    baseline = frame.loc[frame.config_id.astype(str) == "baseline", keys].copy()
+    baseline["truth_baseline"] = truth[frame.config_id.astype(str).to_numpy() == "baseline", metric_index]
+    baseline["prediction_baseline"] = baseline_prediction
+    candidate = frame.loc[candidate_mask, keys].copy()
+    candidate["truth_candidate"] = truth[candidate_mask, metric_index]
+    candidate["prediction_candidate"] = candidate_prediction
+    paired = candidate.merge(baseline, on=keys, validate="many_to_one")
+    return (
+        paired.truth_candidate.to_numpy() - paired.truth_baseline.to_numpy(),
+        paired.prediction_candidate.to_numpy() - paired.prediction_baseline.to_numpy(),
+    )
+
+
+def _delta_report(task, truth_parts, prediction_parts):
+    report = {}
+    if not truth_parts:
+        return report
+    truth = np.concatenate(truth_parts)
+    prediction = np.concatenate(prediction_parts)
+    for index, metric in enumerate(task.output_metrics):
+        selected = truth[:, 0] == index
+        report[metric] = regression_error_report(
+            (task.label_columns[index],), truth[selected, 1:2], prediction[selected, 1:2],
+        )[metric]
+    return report
 
 
 def _random_roi_masks(rows, seed):
@@ -266,11 +379,16 @@ def _checkpoint(fitted: FittedMultiHead, features, labels, task, metric):
     }
 
 
-def _write_predictions(frame, task, truth, prediction, path):
+def _write_predictions(
+    frame, task, truth, prediction, path, *, delta_truth=None, delta_prediction=None,
+):
     table = pa.Table.from_pandas(frame.loc[:, task.identity_columns], preserve_index=False)
     for index, metric in enumerate(task.output_metrics):
         table = table.append_column(f"truth_{metric}", pa.array(truth[:, index]))
         table = table.append_column(f"prediction_{metric}", pa.array(prediction[:, index]))
+        if delta_truth is not None and delta_prediction is not None:
+            table = table.append_column(f"truth_delta_{metric}", pa.array(delta_truth[:, index]))
+            table = table.append_column(f"prediction_delta_{metric}", pa.array(delta_prediction[:, index]))
     pq.write_table(table, path, compression="zstd")
 
 

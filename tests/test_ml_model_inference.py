@@ -11,6 +11,7 @@ import pytest
 
 from anamol.python.design_space import AnalysisConfig
 from anamol.python.design_space import CollectionSamplingConfig
+from anamol.python.design_space import EvaluationConfig
 from anamol.python.design_space import PeregrineConfig
 from anamol.python.design_space import TrainingConfig
 from anamol.python.design_space import load_peregrine_config
@@ -245,7 +246,7 @@ def test_log1p_nonnegative_checkpoint_clamps_physical_predictions(tmp_path: Path
     assert predictor.target_transforms == (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,)
 
 
-def test_l1_evaluation_uses_shared_ood_report_contract(tmp_path: Path) -> None:
+def test_workload_grouped_evaluation_uses_shared_report_contract(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     pd.DataFrame(
@@ -408,9 +409,11 @@ def test_l1_task_uses_one_full_feature_singlehead_protocol() -> None:
     ))
 
     assert task.feature_set.feature_set_id == "trace_design"
+    assert task.identity_columns == ("workload_id", "window_index", "config_id")
+    assert task.group_column == "config_id"
 
 
-def test_workload_ood_evaluation_excludes_heldout_labels_from_its_prediction(tmp_path: Path) -> None:
+def test_workload_grouped_evaluation_excludes_heldout_labels_from_its_prediction(tmp_path: Path) -> None:
     def write_dataset(path: Path, heldout_offset: float) -> None:
         path.mkdir()
         rows = []
@@ -469,13 +472,62 @@ def test_random_roi_evaluation_reports_the_historical_id_split(tmp_path: Path) -
     assert pq.read_table(report["test_predictions"]).num_rows == split["test_rows"]
 
 
+def test_config_evaluation_keeps_every_config_out_of_fit_and_validation(tmp_path: Path) -> None:
+    def write_dataset(path: Path, heldout_offset: float) -> None:
+        path.mkdir()
+        rows = []
+        for config_id in ("baseline", *(f"c{index}" for index in range(6))):
+            config_index = 0 if config_id == "baseline" else int(config_id[1:])
+            for workload_index in range(2):
+                for window_index in range(2):
+                    rows.append({
+                        "workload_id": f"w{workload_index}", "window_index": window_index,
+                        "config_id": config_id, "f0": float(config_index + workload_index + window_index),
+                        "label_CPI": float(config_index + workload_index + window_index + 1 + (heldout_offset if config_id == "c0" else 0.0)),
+                    })
+        pd.DataFrame(rows).to_parquet(path / "samples.parquet", index=False)
+
+    first, second = tmp_path / "first-config", tmp_path / "second-config"
+    write_dataset(first, 0.0)
+    write_dataset(second, 100.0)
+    task = replace(
+        _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",)),
+        identity_columns=("workload_id", "window_index", "config_id"),
+        group_column="config_id", evaluation_folds=3,
+    )
+
+    first_report = evaluate_prediction_task(task=task, dataset_dir=first, output_dir=tmp_path / "first-config-eval")
+    second_report = evaluate_prediction_task(task=task, dataset_dir=second, output_dir=tmp_path / "second-config-eval")
+    first_prediction = pd.read_parquet(first_report["oof_predictions"])
+    second_prediction = pd.read_parquet(second_report["oof_predictions"])
+    first_c0 = first_prediction.loc[first_prediction.config_id == "c0", "prediction_CPI"].to_numpy()
+    second_c0 = second_prediction.loc[second_prediction.config_id == "c0", "prediction_CPI"].to_numpy()
+    evaluation = json.loads(Path(first_report["evaluation"]).read_text())
+
+    assert __import__("numpy").allclose(first_c0, second_c0)
+    assert "baseline" not in set(first_prediction.config_id)
+    assert __import__("numpy").isfinite(
+        first_prediction[["truth_delta_CPI", "prediction_delta_CPI"]].to_numpy()
+    ).all()
+    assert __import__("numpy").mean(__import__("numpy").abs(
+        first_prediction["truth_delta_CPI"] - first_prediction["prediction_delta_CPI"]
+    )) == pytest.approx(
+        evaluation["metrics"]["candidate_minus_baseline_delta"]["CPI"]["mae"]
+    )
+    assert evaluation["protocol"] == "grouped_config_kfold"
+    assert evaluation["generalization_scope"] == "held_out_configuration"
+    for fold in evaluation["outer_folds"]:
+        assert not set(fold["heldout_groups"]) & set(fold["validation_groups"])
+    assert "retrieval" not in evaluation
+
+
 def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
-    ood = tmp_path / "unified_ood"
+    generalization = tmp_path / "config_generalization"
     random_roi = tmp_path / "evaluation"
     plots = tmp_path / "plots"
     dataset.mkdir()
-    ood.mkdir()
+    generalization.mkdir()
     random_roi.mkdir()
     metrics = (
         "CPI",
@@ -498,19 +550,21 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
             rows.append(row)
             predictions.append(pred)
     pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
-    pd.DataFrame(predictions).to_parquet(ood / "oof_predictions.parquet", index=False)
-    ood_report = {
+    pd.DataFrame(predictions).to_parquet(generalization / "oof_predictions.parquet", index=False)
+    generalization_report = {
         "task_id": "l1-surrogate",
+        "generalization_scope": "held_out_configuration",
         "metrics": {
-            "macro_workload": {
+            "per_metric_absolute": {
                 metric: {"smape_pct": 10.0 + offset, "wape_pct": 11.0 + offset}
                 for offset, metric in enumerate(metrics)
             },
         },
     }
-    (ood / "evaluation.json").write_text(json.dumps(ood_report), encoding="utf-8")
+    (generalization / "evaluation.json").write_text(json.dumps(generalization_report), encoding="utf-8")
     random_report = {
         "task_id": "l1-surrogate",
+        "protocol": "random_roi_split",
         "metrics": {
             "roi_weighted": {
                 metric: {"smape_pct": 2.0 + offset, "wape_pct": 3.0 + offset}
@@ -522,7 +576,7 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
 
     report = plot_l1_summary(
         dataset_dir=dataset,
-        workload_ood_dir=ood,
+        config_generalization_dir=generalization,
         random_roi_dir=random_roi,
         output_dir=plots,
     )
@@ -538,10 +592,10 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
 
 def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
-    ood = tmp_path / "unified_ood"
+    generalization = tmp_path / "config_generalization"
     plots = tmp_path / "plots"
     dataset.mkdir()
-    ood.mkdir()
+    generalization.mkdir()
     metrics = (
         "CPI",
         "BRANCH_MPKI",
@@ -556,11 +610,12 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
         prediction[f"truth_{metric}"] = 1.0
         prediction[f"prediction_{metric}"] = 1.0
     pd.DataFrame([row]).to_parquet(dataset / "samples.parquet", index=False)
-    pd.DataFrame([prediction]).to_parquet(ood / "oof_predictions.parquet", index=False)
-    (ood / "evaluation.json").write_text(json.dumps({
+    pd.DataFrame([prediction]).to_parquet(generalization / "oof_predictions.parquet", index=False)
+    (generalization / "evaluation.json").write_text(json.dumps({
         "task_id": "l1-surrogate",
+        "generalization_scope": "held_out_configuration",
         "metrics": {
-            "macro_workload": {
+            "per_metric_absolute": {
                 metric: {"smape_pct": 0.0, "wape_pct": 0.0}
                 for metric in metrics
             },
@@ -569,7 +624,7 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
 
     report = plot_l1_summary(
         dataset_dir=dataset,
-        workload_ood_dir=ood,
+        config_generalization_dir=generalization,
         random_roi_dir=tmp_path / "missing_random_roi",
         output_dir=plots,
     )
@@ -578,7 +633,7 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
     assert report["protocol_errors"]["CPI"]["random_roi_smape_pct"] is None
 
 
-def test_l1_plot_summary_requires_workload_ood_artifacts(tmp_path: Path) -> None:
+def test_l1_plot_summary_requires_config_generalization_artifacts(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     pd.DataFrame({
@@ -589,10 +644,10 @@ def test_l1_plot_summary_requires_workload_ood_artifacts(tmp_path: Path) -> None
         "label_CHI_L2_LD_MPKI": [1.0],
     }).to_parquet(dataset / "samples.parquet", index=False)
 
-    with pytest.raises(FileNotFoundError, match="missing L1 workload-OOD artifacts"):
+    with pytest.raises(FileNotFoundError, match="missing L1 held-out-configuration artifacts"):
         plot_l1_summary(
             dataset_dir=dataset,
-            workload_ood_dir=tmp_path / "missing_ood",
+            config_generalization_dir=tmp_path / "missing_generalization",
             random_roi_dir=tmp_path / "missing_random_roi",
             output_dir=tmp_path / "plots",
         )
@@ -620,12 +675,13 @@ def _training_config() -> PeregrineConfig:
             num_threads=1,
             early_stopping_patience=2,
         ),
+        evaluation=EvaluationConfig(config_folds=3),
     )
 
 
 def _test_task(*, feature_columns: tuple[str, ...], label_columns: tuple[str, ...], output_metrics: tuple[str, ...]) -> PredictionTask:
     return PredictionTask(
-        task_id="l1-test", identity_columns=("workload_id", "region_id", "config_id"),
+        task_id="prediction-test", identity_columns=("workload_id", "region_id", "config_id"),
         group_column="workload_id", feature_set=FeatureSet("trace_design", feature_columns),
         label_columns=label_columns, output_metrics=output_metrics,
         training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),

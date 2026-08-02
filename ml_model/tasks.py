@@ -19,8 +19,8 @@ def l1_task(config: PeregrineConfig) -> PredictionTask:
     features = tuple(config.feature_columns)
     return PredictionTask(
         task_id=L1_TASK_ID,
-        identity_columns=("workload_id", "region_id", "config_id"),
-        group_column="workload_id",
+        identity_columns=("workload_id", "window_index", "config_id"),
+        group_column="config_id",
         feature_set=FeatureSet("trace_design", features),
         label_columns=tuple(config.label_columns),
         output_metrics=tuple(label.removeprefix("label_") for label in config.label_columns),
@@ -30,6 +30,7 @@ def l1_task(config: PeregrineConfig) -> PredictionTask:
             config.training.early_stopping_patience,
         ),
         num_threads=config.training.num_threads or 1, seed=config.training.seed,
+        evaluation_folds=config.evaluation.config_folds,
     )
 
 

@@ -33,7 +33,6 @@ class TrainingConfig:
 @dataclass(frozen=True)
 class EvaluationConfig:
     config_folds: int
-    top_k: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -141,7 +140,6 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
         ),
         evaluation=EvaluationConfig(
             config_folds=int(evaluation["config_folds"]),
-            top_k=tuple(int(value) for value in evaluation["top_k"]),
         ),
     )
     _validate_config(config)
@@ -165,8 +163,6 @@ def _validate_config(config: PeregrineConfig) -> None:
         raise ValueError("training.weight_decay must not be negative")
     if config.evaluation.config_folds < 3:
         raise ValueError("evaluation.config_folds must be at least three")
-    if not config.evaluation.top_k or any(value < 1 for value in config.evaluation.top_k):
-        raise ValueError("evaluation.top_k must contain positive values")
     for name, value in (("paper_test_fraction", config.training.paper_test_fraction),):
         if not 0.0 < value < 1.0:
             raise ValueError(f"training.{name} must be between zero and one")
