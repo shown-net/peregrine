@@ -19,22 +19,23 @@ from anamol.python.microarchitecture import load_microarchitecture_config
 from ml_model.inference import CpuMultiHeadPredictor
 from ml_model.inference import predict_parquet
 from ml_model.model import MultiHeadPeregrineModel
-from ml_model import real_anchor
 from ml_model.multitask import LOG1P_NONNEGATIVE_TARGET_TRANSFORM
 from ml_model.multitask import MultiHeadTraining
 from ml_model.multitask import inverse_transform_targets
 from ml_model.multitask import regression_error_report
 from ml_model.multitask import scale
 from ml_model.multitask import standardize
-from ml_model.plots import plot_l1_summary
+from ml_model.plots import plot_surrogate_summary
 from ml_model.prediction import FeatureSet
 from ml_model.prediction import PredictionTask
 from ml_model.prediction import evaluate_prediction_task
 from ml_model.prediction import evaluate_random_roi_split_prediction_task
 from ml_model.prediction import train_prediction_task
-from ml_model.tasks import l1_task
+from ml_model.tasks import SURROGATE_TASK_ID
+from ml_model.tasks import surrogate_task
 from tests.helpers import METRICS_CONFIG
 from tests.helpers import MICROARCHITECTURE_CONFIG
+from tests.helpers import cpu_microarchitecture_root
 
 
 def test_prediction_task_bundle_uses_paths_relative_to_its_own_directory(tmp_path: Path, monkeypatch) -> None:
@@ -331,30 +332,6 @@ def test_training_rejects_a_constant_label(tmp_path: Path) -> None:
         )
 
 
-def test_l3_task_uses_workload_interval_identity_and_singlehead_models(tmp_path: Path) -> None:
-    from ml_model.prediction import train_prediction_task
-    from ml_model.tasks import l3_task
-
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    rows = []
-    for workload in ("w0", "w1", "w2"):
-        for interval in range(2):
-            row = {"workload_id": workload, "interval_index": interval}
-            for index, column in enumerate(real_anchor.P2_FEATURES):
-                row[column] = float(index + interval + 1)
-            for index, metric in enumerate(real_anchor.target_names()):
-                row[f"label_{metric}"] = float(index + interval + 1)
-            rows.append(row)
-    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
-    task = replace(l3_task(), training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1), num_threads=1)
-    report = train_prediction_task(task=task, dataset_dir=dataset, output_dir=tmp_path / "model")
-    training = json.loads(Path(report["training_report"]).read_text())
-
-    assert set(training["selected"]) == set(real_anchor.target_names())
-    assert all(item["predictor_kind"] == "singlehead" for item in training["selected"].values())
-
-
 def test_shared_error_report_uses_percentage_units_and_zero_safe_mape() -> None:
     report = regression_error_report(
         ("label_CPI",),
@@ -420,9 +397,9 @@ def test_standardize_bounds_a_constant_training_feature_outside_support() -> Non
     assert heldout.tolist() == [[-8.0]]
 
 
-def test_l1_task_uses_one_full_feature_singlehead_protocol() -> None:
-    task = l1_task(load_peregrine_config(
-        "configs/peregrine.yaml", metrics_config=METRICS_CONFIG,
+def test_surrogate_task_uses_one_full_feature_singlehead_protocol() -> None:
+    task = surrogate_task(load_peregrine_config(
+        cpu_microarchitecture_root() / "peregrine/configs/peregrine.yaml", metrics_config=METRICS_CONFIG,
         microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
     ))
 
@@ -523,15 +500,8 @@ def test_config_evaluation_keeps_every_config_out_of_fit_and_validation(tmp_path
     evaluation = json.loads(Path(first_report["evaluation"]).read_text())
 
     assert __import__("numpy").allclose(first_c0, second_c0)
-    assert "baseline" not in set(first_prediction.config_id)
-    assert __import__("numpy").isfinite(
-        first_prediction[["truth_delta_CPI", "prediction_delta_CPI"]].to_numpy()
-    ).all()
-    assert __import__("numpy").mean(__import__("numpy").abs(
-        first_prediction["truth_delta_CPI"] - first_prediction["prediction_delta_CPI"]
-    )) == pytest.approx(
-        evaluation["metrics"]["candidate_minus_baseline_delta"]["CPI"]["mae"]
-    )
+    assert set(first_prediction.config_id) == {"baseline", *(f"c{index}" for index in range(6))}
+    assert evaluation["metrics"]["per_metric_absolute"]["CPI"]["mae"] is not None
     assert evaluation["protocol"] == "grouped_config_kfold"
     assert evaluation["generalization_scope"] == "held_out_configuration"
     for fold in evaluation["outer_folds"]:
@@ -570,7 +540,7 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
     pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
     pd.DataFrame(predictions).to_parquet(generalization / "oof_predictions.parquet", index=False)
     generalization_report = {
-        "task_id": "l1-surrogate",
+        "task_id": SURROGATE_TASK_ID,
         "generalization_scope": "held_out_configuration",
         "metrics": {
             "per_metric_absolute": {
@@ -581,7 +551,7 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
     }
     (generalization / "evaluation.json").write_text(json.dumps(generalization_report), encoding="utf-8")
     random_report = {
-        "task_id": "l1-surrogate",
+        "task_id": SURROGATE_TASK_ID,
         "protocol": "random_roi_split",
         "metrics": {
             "roi_weighted": {
@@ -592,7 +562,7 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
     }
     (random_roi / "evaluation.json").write_text(json.dumps(random_report), encoding="utf-8")
 
-    report = plot_l1_summary(
+    report = plot_surrogate_summary(
         dataset_dir=dataset,
         config_generalization_dir=generalization,
         random_roi_dir=random_roi,
@@ -600,7 +570,7 @@ def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
     )
     summary = json.loads(Path(report["summary"]).read_text(encoding="utf-8"))
 
-    assert summary["task_id"] == "l1-surrogate"
+    assert summary["task_id"] == SURROGATE_TASK_ID
     assert summary["metrics"] == list(metrics)
     assert summary["protocol_errors"]["CPI"]["gap_smape_pct"] == 8.0
     assert summary["workload_errors"]["CPI"]["w0"]["rows"] == 3
@@ -630,7 +600,7 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
     pd.DataFrame([row]).to_parquet(dataset / "samples.parquet", index=False)
     pd.DataFrame([prediction]).to_parquet(generalization / "oof_predictions.parquet", index=False)
     (generalization / "evaluation.json").write_text(json.dumps({
-        "task_id": "l1-surrogate",
+        "task_id": SURROGATE_TASK_ID,
         "generalization_scope": "held_out_configuration",
         "metrics": {
             "per_metric_absolute": {
@@ -640,7 +610,7 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
         },
     }), encoding="utf-8")
 
-    report = plot_l1_summary(
+    report = plot_surrogate_summary(
         dataset_dir=dataset,
         config_generalization_dir=generalization,
         random_roi_dir=tmp_path / "missing_random_roi",
@@ -651,7 +621,7 @@ def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
     assert report["protocol_errors"]["CPI"]["random_roi_smape_pct"] is None
 
 
-def test_l1_plot_summary_requires_config_generalization_artifacts(tmp_path: Path) -> None:
+def test_surrogate_plot_summary_requires_config_generalization_artifacts(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     dataset.mkdir()
     pd.DataFrame({
@@ -662,8 +632,8 @@ def test_l1_plot_summary_requires_config_generalization_artifacts(tmp_path: Path
         "label_CHI_L2_LD_MPKI": [1.0],
     }).to_parquet(dataset / "samples.parquet", index=False)
 
-    with pytest.raises(FileNotFoundError, match="missing L1 held-out-configuration artifacts"):
-        plot_l1_summary(
+    with pytest.raises(FileNotFoundError, match="missing surrogate held-out-configuration artifacts"):
+        plot_surrogate_summary(
             dataset_dir=dataset,
             config_generalization_dir=tmp_path / "missing_generalization",
             random_roi_dir=tmp_path / "missing_random_roi",

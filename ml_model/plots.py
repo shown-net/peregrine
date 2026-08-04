@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 
 from .dataset_io import read_dataset_shards
-from .tasks import L1_TASK_ID
+from .tasks import SURROGATE_TASK_ID
 
 
-def plot_l1_summary(
+def plot_surrogate_summary(
     *,
     dataset_dir: str | Path,
     config_generalization_dir: str | Path,
@@ -33,16 +33,16 @@ def plot_l1_summary(
     generalization_predictions_path = generalization_root / "oof_predictions.parquet"
     if not generalization_evaluation_path.is_file() or not generalization_predictions_path.is_file():
         raise FileNotFoundError(
-            "missing L1 held-out-configuration artifacts; run "
-            "`python -m src.cli modeling l1 evaluate --protocol config-generalization` "
+            "missing surrogate held-out-configuration artifacts; run "
+            "`python -m src.cli modeling surrogate evaluate --protocol config-generalization` "
             "from the cpu_microarchitecture repository"
         )
     generalization_evaluation = _read_json(generalization_evaluation_path)
     if (
-        generalization_evaluation.get("task_id") != L1_TASK_ID
+        generalization_evaluation.get("task_id") != SURROGATE_TASK_ID
         or generalization_evaluation.get("generalization_scope") != "held_out_configuration"
     ):
-        raise ValueError(f"configuration-generalization evaluation is not canonical L1: {generalization_evaluation_path}")
+        raise ValueError(f"configuration-generalization evaluation is not canonical surrogate: {generalization_evaluation_path}")
     absolute = (generalization_evaluation.get("metrics") or {}).get("per_metric_absolute") or {}
     metrics = tuple(absolute)
     if not metrics:
@@ -55,20 +55,20 @@ def plot_l1_summary(
     random_evaluation_path = random_root / "evaluation.json"
     random_evaluation = _read_json(random_evaluation_path) if random_evaluation_path.is_file() else None
     if random_evaluation is not None and (
-        random_evaluation.get("task_id") != L1_TASK_ID
+        random_evaluation.get("task_id") != SURROGATE_TASK_ID
         or random_evaluation.get("protocol") != "random_roi_split"
     ):
-        raise ValueError(f"random-ROI evaluation is not an L1 in-distribution diagnostic: {random_evaluation_path}")
+        raise ValueError(f"random-ROI evaluation is not a surrogate in-distribution diagnostic: {random_evaluation_path}")
 
-    label_plot = output / "l1_label_distributions.png"
-    protocol_plot = output / "l1_generalization_protocol_errors.png"
-    workload_plot = output / "l1_workload_error_points.png"
+    label_plot = output / "surrogate_label_distributions.png"
+    protocol_plot = output / "surrogate_generalization_protocol_errors.png"
+    workload_plot = output / "surrogate_workload_error_points.png"
     _plot_label_distributions(label_frame, metrics, label_plot)
     _plot_protocol_errors(generalization_evaluation, random_evaluation, metrics, protocol_plot)
     _plot_workload_error_points(generalization_predictions, metrics, workload_plot)
 
     report = {
-        "task_id": L1_TASK_ID,
+        "task_id": SURROGATE_TASK_ID,
         "metrics": list(metrics),
         "artifact_inputs": {
             "dataset_dir": str(dataset_root),
@@ -110,9 +110,9 @@ def _require_prediction_columns(frame: pd.DataFrame, metrics: tuple[str, ...]) -
         if column not in frame
     ]
     if missing:
-        raise ValueError(f"L1 prediction artifact is missing columns: {missing}")
+        raise ValueError(f"surrogate prediction artifact is missing columns: {missing}")
     if "workload_id" not in frame:
-        raise ValueError("L1 prediction artifact is missing workload_id")
+        raise ValueError("surrogate prediction artifact is missing workload_id")
 
 
 def _distribution(values: np.ndarray) -> dict[str, float]:
@@ -248,7 +248,7 @@ def _plot_protocol_errors(
     axis.set_xticks(x)
     axis.set_xticklabels(metrics, rotation=25, ha="right")
     axis.set_ylabel("SMAPE%")
-    axis.set_title("L1 Generalization Error by Protocol")
+    axis.set_title("Surrogate Generalization Error by Protocol")
     axis.grid(True, axis="y", linestyle="--", alpha=0.35)
     axis.legend()
     figure.tight_layout()

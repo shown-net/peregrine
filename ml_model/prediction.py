@@ -122,57 +122,33 @@ def evaluate_prediction_task(
     frame = _read_task_frame(task, dataset_dir, workload_ids)
     values = frame[task.group_column].astype(str).to_numpy()
     groups = tuple(sorted(set(values)))
-    baseline_rows = (
-        frame["config_id"].astype(str).to_numpy() == "baseline"
-        if task.group_column == "config_id" and "config_id" in frame
-        else np.zeros(len(frame), dtype=bool)
-    )
-    evaluation_groups = tuple(group for group in groups if group != "baseline")
+    evaluation_groups = groups
     fold_count = task.evaluation_folds if task.group_column == "config_id" else len(groups)
     if len(evaluation_groups) < fold_count:
         raise ValueError("grouped evaluation has fewer groups than folds")
     truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
     features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
     prediction = np.empty_like(truth)
-    delta_truth_by_row = np.full_like(truth, np.nan)
-    delta_prediction_by_row = np.full_like(truth, np.nan)
     evaluated = np.zeros(len(frame), dtype=bool)
     folds: list[dict[str, object]] = []
     fold_groups = _group_folds(evaluation_groups, fold_count, task.seed)
-    delta_truth: list[np.ndarray] = []
-    delta_prediction: list[np.ndarray] = []
     for offset, heldout in enumerate(fold_groups):
         validation_groups = fold_groups[(offset + 1) % len(fold_groups)]
         test = np.isin(values, heldout)
         valid = np.isin(values, validation_groups)
         train = ~(test | valid)
         evaluated |= test
-        metric_epochs: dict[str, int] = {}
-        for index, metric in enumerate(task.output_metrics):
-            fitted = fit_multihead(
-                training=task.training, train_x=features[train], train_y=truth[train, index:index + 1],
-                validation_x=features[valid], validation_y=truth[valid, index:index + 1],
-                seed=task.seed + offset * len(task.output_metrics) + index,
-                label_columns=(task.label_columns[index],),
-            )
-            prediction[test, index] = predict_multihead(fitted, features[test])[:, 0]
-            if baseline_rows.any():
-                baseline_prediction = predict_multihead(fitted, features[baseline_rows])[:, 0]
-                fold_truth, fold_prediction = _candidate_baseline_deltas(
-                    frame=frame, metric_index=index, truth=truth,
-                    candidate_prediction=prediction[test, index], candidate_mask=test,
-                    baseline_prediction=baseline_prediction,
-                )
-                delta_truth.append(np.column_stack((np.full(len(fold_truth), index), fold_truth)))
-                delta_prediction.append(np.column_stack((np.full(len(fold_prediction), index), fold_prediction)))
-                delta_truth_by_row[test, index] = fold_truth
-                delta_prediction_by_row[test, index] = fold_prediction
-            metric_epochs[metric] = fitted.epochs
+        fitted = fit_multihead(
+            training=task.training, train_x=features[train], train_y=truth[train],
+            validation_x=features[valid], validation_y=truth[valid], seed=task.seed + offset,
+            label_columns=task.label_columns,
+        )
+        prediction[test] = predict_multihead(fitted, features[test])
         folds.append({
             "heldout_groups": heldout,
             "validation_groups": validation_groups,
             "train_rows": int(train.sum()), "validation_rows": int(valid.sum()),
-            "test_rows": int(test.sum()), "epochs": metric_epochs,
+            "test_rows": int(test.sum()), "epochs": fitted.epochs,
         })
     destination = Path(output_dir)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -189,14 +165,11 @@ def evaluate_prediction_task(
         evaluated_truth,
         evaluated_prediction,
         oof_path,
-        delta_truth=delta_truth_by_row[evaluated] if baseline_rows.any() else None,
-        delta_prediction=delta_prediction_by_row[evaluated] if baseline_rows.any() else None,
     )
     if task.group_column == "config_id":
         metric_report = {
             "roi_weighted": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
             "per_metric_absolute": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
-            "candidate_minus_baseline_delta": _delta_report(task, delta_truth, delta_prediction),
         }
         primary_metric = _primary_metric("roi_weighted")
     else:
