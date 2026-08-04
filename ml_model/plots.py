@@ -34,8 +34,8 @@ def plot_l1_summary(
     if not generalization_evaluation_path.is_file() or not generalization_predictions_path.is_file():
         raise FileNotFoundError(
             "missing L1 held-out-configuration artifacts; run "
-            "`peregrine model evaluate --task l1-surrogate --protocol config-generalization "
-            "--dataset-dir <dataset> --output-dir <config_generalization_dir>`"
+            "`python -m src.cli modeling l1 evaluate --protocol config-generalization` "
+            "from the cpu_microarchitecture repository"
         )
     generalization_evaluation = _read_json(generalization_evaluation_path)
     if (

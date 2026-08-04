@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from importlib.machinery import SourceFileLoader
-from importlib.util import module_from_spec
-from importlib.util import spec_from_loader
 from pathlib import Path
 
 import yaml
@@ -34,13 +31,3 @@ def load_test_config():
         metrics_config=METRICS_CONFIG,
         microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
     )
-
-
-def load_cli_module():
-    loader = SourceFileLoader("peregrine_cli_script", str(Path("peregrine").resolve()))
-    spec = spec_from_loader(loader.name, loader)
-    if spec is None:
-        raise RuntimeError("failed to load Peregrine CLI script")
-    module = module_from_spec(spec)
-    loader.exec_module(module)
-    return module

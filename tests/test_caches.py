@@ -2,9 +2,8 @@ from typing import override
 import unittest
 import numpy as np
 from evantrace.caches import Cache
+from evantrace.caches import MAIN_MEMORY_LATENCY
 from evantrace.replacement_policies import ReplacementPolicy
-
-MAIN_MEMORY_LATENCY = 100
 
 class Test4WayLRUCache(unittest.TestCase):
     """
