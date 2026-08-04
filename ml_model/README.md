@@ -5,7 +5,7 @@ identity, metric formulas, design domains, constraints, and full-ROI trace/stati
 evidence. The parent repository owns the canonical workflow entrypoints.
 Peregrine provides the Python APIs for surrogate training/inference and the
 N2-anchored calibrator. The calibrator consumes canonical config vectors plus
-frozen surrogate metric predictions aggregated to the PMU observation window.
-It learns a pointwise residual map with paired baseline supervision and
-balanced Sinkhorn distribution alignment; it does not consume trace, raw stats,
-or analytical feature summaries.
+simulator metric windows and maps them directly to fixed-N2 performance intervals.
+Repeated PMU samples provide target means and sample covariance; reference windows
+use paired Gaussian moment supervision while other configs provide balanced OT
+regularization. Inference does not consume PMU targets or OT couplings.

@@ -28,6 +28,7 @@ from ml_model.multitask import standardize
 from ml_model.plots import plot_surrogate_summary
 from ml_model.prediction import FeatureSet
 from ml_model.prediction import PredictionTask
+from ml_model.prediction import _read_task_frame
 from ml_model.prediction import evaluate_prediction_task
 from ml_model.prediction import evaluate_random_roi_split_prediction_task
 from ml_model.prediction import train_prediction_task
@@ -639,6 +640,33 @@ def test_surrogate_plot_summary_requires_config_generalization_artifacts(tmp_pat
             random_roi_dir=tmp_path / "missing_random_roi",
             output_dir=tmp_path / "plots",
         )
+
+
+def test_workload_selection_is_independent_of_prediction_grouping(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    pd.DataFrame({
+        "workload_id": ("work_a", "work_a", "work_b"),
+        "window_index": (0, 1, 0),
+        "config_id": ("config_a", "config_a", "config_a"),
+        "feature": (1.0, 2.0, 3.0),
+        "label": (1.0, 2.0, 3.0),
+    }).to_parquet(dataset / "samples.parquet", index=False)
+    task = PredictionTask(
+        task_id="prediction-test",
+        identity_columns=("workload_id", "window_index", "config_id"),
+        group_column="config_id",
+        feature_set=FeatureSet("trace_design", ("feature",)),
+        label_columns=("label",),
+        output_metrics=("metric",),
+        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
+        num_threads=1,
+        seed=7,
+    )
+
+    frame = _read_task_frame(task, dataset, ("work_a",))
+
+    assert frame["workload_id"].tolist() == ["work_a", "work_a"]
 
 
 def _training_config() -> PeregrineConfig:

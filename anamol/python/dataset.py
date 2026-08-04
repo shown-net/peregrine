@@ -50,6 +50,24 @@ class FullRoiConfigSample:
 
 
 @dataclass(frozen=True)
+class ConfigStatsSample:
+    """One canonical full-ROI gem5 config artifact shared by model builders."""
+
+    config: RunConfig
+    stats_path: Path
+    window_count: int
+
+
+@dataclass(frozen=True)
+class ConfigStatsWorkload:
+    """The raw config-stats evidence for one workload."""
+
+    workload_id: str
+    reference_trace_path: Path
+    samples: tuple[ConfigStatsSample, ...]
+
+
+@dataclass(frozen=True)
 class DatasetTableContext:
     analytical_columns: tuple[str, ...]
     categorical_values: dict[str, tuple[str, ...]]
@@ -100,6 +118,56 @@ def build_full_roi_window_dataset_shards(
         for future in futures:
             reports.append(future.result())
     return {"dataset": str(out), "shards": sorted(expected_shards), "workloads": reports}
+
+
+def load_config_stats_workload(
+    *, config: PeregrineConfig, raw_root: str | Path, workload_id: str,
+) -> ConfigStatsWorkload:
+    """Load the single canonical raw config-stats contract for a workload.
+
+    Both the surrogate dataset builder and the fixed-N2 calibrator use this
+    loader.  It owns raw layout validation so consumers do not rescan and
+    reinterpret the same gem5 artifacts independently.
+    """
+    root = Path(raw_root)
+    configs_root = root / "workloads" / workload_id / "configs"
+    if not configs_root.is_dir():
+        raise FileNotFoundError(f"missing config-stats artifacts: {configs_root}")
+    reference_id = config.microarchitecture.config_id({})
+    reference_trace_path = configs_root / reference_id / TRACE_FILE
+    if not reference_trace_path.is_file() or reference_trace_path.stat().st_size == 0:
+        raise FileNotFoundError(f"missing config-stats reference trace: {reference_trace_path}")
+    samples: list[ConfigStatsSample] = []
+    expected_windows: int | None = None
+    for config_root in sorted(
+        (path for path in configs_root.iterdir() if path.is_dir()),
+        key=lambda path: (path.name != reference_id, path.name),
+    ):
+        stats_path = config_root / "stats.h5"
+        if not stats_path.is_file():
+            raise FileNotFoundError(f"missing config-stats statistics: {stats_path}")
+        labels = read_label_values(stats_path, config.labels)
+        window_count = int(labels.shape[0])
+        if window_count <= 0:
+            raise ValueError(f"config-stats artifact has no complete windows: {stats_path}")
+        if expected_windows is None:
+            expected_windows = window_count
+        elif window_count != expected_windows:
+            raise ValueError(
+                f"config-stats window counts differ: expected {expected_windows}, "
+                f"got {window_count} at {stats_path}"
+            )
+        run_config = (
+            config.run_config_from_args(reference_id, config.microarchitecture.gem5_args())
+            if config_root.name == reference_id
+            else _run_config_from_log(config_root, config)
+        )
+        if run_config.config_id != config_root.name:
+            raise ValueError(f"config-stats identity differs from artifact directory: {config_root}")
+        samples.append(ConfigStatsSample(run_config, stats_path, window_count))
+    if not samples:
+        raise ValueError(f"config-stats workload has no configuration artifacts: {workload_id}")
+    return ConfigStatsWorkload(workload_id, reference_trace_path, tuple(samples))
 
 
 def build_dataset_shards(
@@ -382,15 +450,9 @@ def _build_full_roi_workload_dataset(
     destination: Path,
     full_roi_window_size: int,
 ) -> dict[str, int | str]:
-    workload_root = raw_root / "workloads" / workload_id
-    configs_root = workload_root / "configs"
-    if not configs_root.is_dir():
-        raise FileNotFoundError(f"missing full-ROI config artifacts: {configs_root}")
-    baseline_root = configs_root / "baseline"
-    trace_path = baseline_root / TRACE_FILE
-    if not trace_path.is_file() or trace_path.stat().st_size == 0:
-        raise FileNotFoundError(f"missing full-ROI baseline trace: {trace_path}")
-    samples = _full_roi_config_samples(configs_root, config=config)
+    raw = load_config_stats_workload(config=config, raw_root=raw_root, workload_id=workload_id)
+    trace_path = raw.reference_trace_path
+    samples = _full_roi_config_samples(config=config, raw_root=raw_root, workload_id=workload_id)
     if not samples:
         raise ValueError(f"full-ROI workload contains no config samples: {workload_id}")
     window_count = samples[0].labels.shape[0]
@@ -430,38 +492,20 @@ def _build_full_roi_workload_dataset(
     return {"workload_id": workload_id, "rows": rows, "configs": len(samples), "windows": window_count}
 
 
-def _full_roi_config_samples(configs_root: Path, *, config: PeregrineConfig) -> tuple[FullRoiConfigSample, ...]:
+def _full_roi_config_samples(
+    *, config: PeregrineConfig, raw_root: Path, workload_id: str,
+) -> tuple[FullRoiConfigSample, ...]:
+    raw = load_config_stats_workload(config=config, raw_root=raw_root, workload_id=workload_id)
     samples: list[FullRoiConfigSample] = []
-    expected_windows: int | None = None
-    for config_root in sorted(
-        (path for path in configs_root.iterdir() if path.is_dir()),
-        key=lambda path: (path.name != "baseline", path.name),
-    ):
-        stats_path = config_root / "stats.h5"
-        if not stats_path.is_file():
-            raise FileNotFoundError(f"missing full-ROI configuration statistics: {stats_path}")
-        labels = read_label_values(stats_path, config.labels)
+    for sample in raw.samples:
+        labels = read_label_values(sample.stats_path, config.labels)
         if labels.ndim != 2 or labels.shape[1] != len(config.labels.labels) or not np.isfinite(labels).all():
-            raise ValueError(f"invalid full-ROI labels: {stats_path}")
-        if expected_windows is None:
-            expected_windows = labels.shape[0]
-        elif labels.shape[0] != expected_windows:
-            raise ValueError(
-                f"full-ROI config window counts differ: expected {expected_windows}, got {labels.shape[0]} at {stats_path}"
-            )
-        run_config = (
-            config.run_config_from_args(
-                config.microarchitecture.config_id({}),
-                config.microarchitecture.gem5_args(),
-            )
-            if config_root.name == "baseline"
-            else _run_config_from_log(config_root, config)
-        )
+            raise ValueError(f"invalid full-ROI labels: {sample.stats_path}")
         samples.append(
             FullRoiConfigSample(
-                config_id=config_root.name,
-                config=RunConfig(config_root.name, run_config.parameter_values, run_config.gem5_args),
-                stats_path=stats_path,
+                config_id=sample.config.config_id,
+                config=sample.config,
+                stats_path=sample.stats_path,
                 labels=labels,
             )
         )

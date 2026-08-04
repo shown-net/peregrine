@@ -261,7 +261,7 @@ def _read_task_frame(task, dataset_dir, workload_ids):
     columns = tuple(dict.fromkeys((*task.identity_columns, *task.label_columns, *task.feature_set.columns)))
     frame = read_dataset_shards(dataset_dir, columns=columns)
     if workload_ids is not None:
-        frame = frame[frame[task.group_column].isin(workload_ids)].copy()
+        frame = frame[frame["workload_id"].isin(workload_ids)].copy()
     _validate_task_frame(task, frame)
     return frame
 
