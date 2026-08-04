@@ -10,6 +10,7 @@ from anamol.python.microarchitecture import load_microarchitecture_config
 from anamol.python.dataset import build_full_roi_window_dataset_shards
 from ml_model.inference import PredictorBundle
 from ml_model.inference import predict_bundle_parquet
+from ml_model.l2 import search_l2
 from ml_model.plots import plot_l1_summary
 from ml_model.prediction import train_prediction_task
 from ml_model.prediction import evaluate_prediction_task
@@ -87,6 +88,21 @@ def _plot_l1_summary(args: argparse.Namespace) -> int:
         config_generalization_dir=args.config_generalization_dir,
         random_roi_dir=args.random_roi_dir,
         output_dir=args.output_dir,
+    ))
+
+
+def _l2_search(args: argparse.Namespace) -> int:
+    config = load_peregrine_config(
+        args.config, metrics_config=args.metrics_config,
+        microarchitecture=load_microarchitecture_config(args.microarchitecture_config),
+    )
+    return _print_json(search_l2(
+        config=config, bundle_path=args.bundle, raw_root=args.raw_root,
+        dataset_dir=args.dataset_dir, output_dir=args.output_dir,
+        exploration_count=args.exploration_count, queue_size=args.queue_size,
+        queue_batch_size=args.queue_batch_size,
+        analysis_batch_size=args.analysis_batch_size,
+        inference_batch_size=args.inference_batch_size, seed=args.seed,
     ))
 
 
@@ -193,6 +209,24 @@ def build_parser() -> argparse.ArgumentParser:
     l1_summary.add_argument("--random-roi-dir", default=str(DEFAULT_EVALUATION_DIR))
     l1_summary.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_ROOT / "plots_l1"))
     l1_summary.set_defaults(func=_plot_l1_summary)
+
+    l2 = sub.add_parser("l2")
+    l2_sub = l2.add_subparsers(dest="action", required=True)
+    search = l2_sub.add_parser("search")
+    search.add_argument("--config", default="configs/peregrine.yaml")
+    search.add_argument("--metrics-config", required=True)
+    search.add_argument("--microarchitecture-config", required=True)
+    search.add_argument("--bundle", required=True)
+    search.add_argument("--raw-root", required=True)
+    search.add_argument("--dataset-dir", required=True)
+    search.add_argument("--output-dir", required=True)
+    search.add_argument("--exploration-count", type=int, required=True)
+    search.add_argument("--queue-size", type=int, required=True)
+    search.add_argument("--queue-batch-size", type=int, required=True)
+    search.add_argument("--analysis-batch-size", type=int, default=16)
+    search.add_argument("--inference-batch-size", type=int, default=4096)
+    search.add_argument("--seed", type=int, required=True)
+    search.set_defaults(func=_l2_search)
 
     return parser
 

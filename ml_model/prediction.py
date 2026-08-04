@@ -357,15 +357,20 @@ def _primary_metric(aggregation):
 
 def _macro_workload_report(task, values, truth, prediction):
     per_workload = _per_workload_report(task, values, truth, prediction)
-    report: dict[str, dict[str, float | int]] = {}
+    report: dict[str, dict[str, float | int | None]] = {}
     for metric in task.output_metrics:
         reports = [per_workload[workload][metric] for workload in per_workload]
         report[metric] = {
-            key: float(np.mean([entry[key] for entry in reports]))
+            key: _optional_mean(entry[key] for entry in reports)
             for key in ("mae", "rmse", "mape_pct", "p90_absolute_error", "wape_pct", "smape_pct")
         }
         report[metric]["mape_nonzero_rows"] = int(sum(entry["mape_nonzero_rows"] for entry in reports))
     return report
+
+
+def _optional_mean(values):
+    finite = [float(value) for value in values if value is not None]
+    return float(np.mean(finite)) if finite else None
 
 
 def _checkpoint(fitted: FittedMultiHead, features, labels, task, metric):

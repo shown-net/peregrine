@@ -384,6 +384,22 @@ def test_macro_workload_mape_does_not_follow_roi_sample_counts() -> None:
     assert roi["mape_pct"] == 25.0
 
 
+def test_macro_workload_report_preserves_optional_percentage_metrics() -> None:
+    from ml_model.prediction import _macro_workload_report
+
+    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
+    values = __import__("numpy").array(["zero", "nonzero"])
+    truth = __import__("numpy").array([[0.0], [10.0]], dtype="float32")
+    prediction = __import__("numpy").array([[1.0], [5.0]], dtype="float32")
+
+    macro = _macro_workload_report(task, values, truth, prediction)["CPI"]
+
+    assert macro["mae"] == 3.0
+    assert macro["mape_pct"] == 50.0
+    assert macro["mape_nonzero_rows"] == 1
+    assert macro["wape_pct"] == 50.0
+
+
 def test_log1p_inverse_transform_is_nonnegative() -> None:
     restored = inverse_transform_targets(
         __import__("numpy").array([[-100.0], [0.0], [100.0]], dtype="float32"),

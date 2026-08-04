@@ -772,6 +772,38 @@ def _full_roi_feature_table(
     )
 
 
+def build_candidate_feature_table(
+    *,
+    config: PeregrineConfig,
+    workload_id: str,
+    trace_path: str | Path,
+    window_count: int,
+    run_configs: tuple[RunConfig, ...],
+    full_roi_window_size: int,
+) -> pa.Table:
+    """Analyze one existing rich trace for a batch of candidate configurations."""
+    features = analyze_full_roi_windows(
+        trace_path=trace_path,
+        configs=tuple(_analytical_config(item, config) for item in run_configs),
+        full_roi_window_size=full_roi_window_size,
+        analysis_window_size=config.analysis.window_size,
+        window_count=window_count,
+        mechanisms=config.microarchitecture.mechanisms,
+    )
+    context = _dataset_table_context(config)
+    return pa.concat_tables([
+        _full_roi_feature_table(
+            workload_id=workload_id,
+            window_index=window_index,
+            feature_values=features[window_index],
+            configs=run_configs,
+            config=config,
+            table_context=context,
+        )
+        for window_index in range(window_count)
+    ])
+
+
 def _dataset_table(
     *,
     workload_id: str,
