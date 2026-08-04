@@ -33,6 +33,8 @@ from ml_model.prediction import evaluate_prediction_task
 from ml_model.prediction import evaluate_random_roi_split_prediction_task
 from ml_model.prediction import train_prediction_task
 from ml_model.tasks import l1_task
+from tests.helpers import METRICS_CONFIG
+from tests.helpers import MICROARCHITECTURE_CONFIG
 
 
 def test_prediction_task_bundle_uses_paths_relative_to_its_own_directory(tmp_path: Path, monkeypatch) -> None:
@@ -420,8 +422,8 @@ def test_standardize_bounds_a_constant_training_feature_outside_support() -> Non
 
 def test_l1_task_uses_one_full_feature_singlehead_protocol() -> None:
     task = l1_task(load_peregrine_config(
-        "configs/peregrine.yaml", metrics_config="../cpu_microarchitecture/configs/metrics.yaml",
-        microarchitecture=load_microarchitecture_config("../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml"),
+        "configs/peregrine.yaml", metrics_config=METRICS_CONFIG,
+        microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
     ))
 
     assert task.feature_set.feature_set_id == "trace_design"
@@ -671,9 +673,7 @@ def test_l1_plot_summary_requires_config_generalization_artifacts(tmp_path: Path
 
 def _training_config() -> PeregrineConfig:
     return PeregrineConfig(
-        microarchitecture=load_microarchitecture_config(
-            "../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml"
-        ),
+        microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
         analysis=AnalysisConfig(window_size=1),
         collection_sampling=CollectionSamplingConfig(
             seed=7,

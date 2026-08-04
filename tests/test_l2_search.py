@@ -12,15 +12,15 @@ from ml_model.l2 import consume_candidate_queue
 from ml_model.l2 import generate_legal_configs
 from ml_model.l2 import pareto_mask
 from ml_model.l2 import prioritized_pareto_indices
+from tests.helpers import METRICS_CONFIG
+from tests.helpers import MICROARCHITECTURE_CONFIG
 
 
 def _config():
     return load_peregrine_config(
         "configs/peregrine.yaml",
-        metrics_config="../cpu_microarchitecture/configs/metrics.yaml",
-        microarchitecture=load_microarchitecture_config(
-            "../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml"
-        ),
+        metrics_config=METRICS_CONFIG,
+        microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
     )
 
 

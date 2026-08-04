@@ -11,8 +11,16 @@ from anamol.python.design_space import load_peregrine_config
 from anamol.python.microarchitecture import load_microarchitecture_config
 
 
-METRICS_CONFIG = Path("../cpu_microarchitecture/configs/metrics.yaml")
-MICROARCHITECTURE_CONFIG = Path("../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml")
+def cpu_microarchitecture_root() -> Path:
+    root = Path.cwd().resolve()
+    for candidate in (root.parent, root.parent / "cpu_microarchitecture"):
+        if (candidate / "configs/metrics.yaml").is_file():
+            return candidate
+    raise FileNotFoundError("could not locate cpu_microarchitecture config root")
+
+
+METRICS_CONFIG = cpu_microarchitecture_root() / "configs/metrics.yaml"
+MICROARCHITECTURE_CONFIG = cpu_microarchitecture_root() / "configs/microarchitectures/zte_neoverse_n2.yaml"
 
 
 def default_metric_set_id() -> str:

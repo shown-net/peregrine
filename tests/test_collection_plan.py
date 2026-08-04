@@ -20,6 +20,7 @@ from anamol.python.feature_pipeline import mechanism_bindings
 from anamol.python.feature_pipeline import trace_section_counts
 from anamol.python.microarchitecture import load_microarchitecture_config
 from anamol.python.run_config import RunConfig
+from tests.helpers import MICROARCHITECTURE_CONFIG
 from tests.helpers import load_test_config
 
 
@@ -193,7 +194,7 @@ def test_anamol_binding_carries_canonical_cache_geometry() -> None:
 
 
 def test_microarchitecture_loader_rejects_retired_top_level_keys(tmp_path: Path) -> None:
-    source = Path("../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml")
+    source = MICROARCHITECTURE_CONFIG
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))
     payload["analysis_bindings"] = {"mechanisms": []}
     path = tmp_path / "microarchitecture.yaml"
@@ -204,7 +205,7 @@ def test_microarchitecture_loader_rejects_retired_top_level_keys(tmp_path: Path)
 
 
 def test_microarchitecture_loader_rejects_retired_component_fields(tmp_path: Path) -> None:
-    source = Path("../cpu_microarchitecture/configs/microarchitectures/zte_neoverse_n2.yaml")
+    source = MICROARCHITECTURE_CONFIG
     payload = yaml.safe_load(source.read_text(encoding="utf-8"))
     payload["analysis"]["components"][0]["formula"] = payload["analysis"]["components"][0]["model"]
     path = tmp_path / "microarchitecture.yaml"
