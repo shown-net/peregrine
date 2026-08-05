@@ -12,6 +12,9 @@ from .microarchitecture import MicroarchitectureConfig
 from .run_config import RunConfig
 
 
+WORKLOAD_CONTEXT_STATISTICS = ("mean", "p90", "std", "active_ratio")
+
+
 @dataclass(frozen=True)
 class AnalysisConfig:
     window_size: int
@@ -69,6 +72,7 @@ class PeregrineConfig:
             *self.numeric_design_parameter_names,
             *self.categorical_feature_columns,
             *reciprocal_feature_columns(),
+            *workload_context_feature_columns(self.microarchitecture.mechanisms),
         )
 
     @property
@@ -148,6 +152,14 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
 
 def reciprocal_feature_columns() -> tuple[str, ...]:
     return ("inv_rob_size", "inv_lq_entries", "inv_sq_entries")
+
+
+def workload_context_feature_columns(mechanisms) -> tuple[str, ...]:
+    return tuple(
+        f"workload_context_{statistic}__{mechanism.name}"
+        for mechanism in mechanisms
+        for statistic in WORKLOAD_CONTEXT_STATISTICS
+    )
 
 
 def _validate_config(config: PeregrineConfig) -> None:

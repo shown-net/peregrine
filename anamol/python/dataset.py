@@ -12,7 +12,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .design_space import PeregrineConfig, reciprocal_feature_columns
+from .design_space import PeregrineConfig, reciprocal_feature_columns, workload_context_feature_columns
 from .feature_pipeline import (
     FeatureBatch,
     analyze_full_roi_windows,
@@ -70,6 +70,7 @@ class ConfigStatsWorkload:
 @dataclass(frozen=True)
 class DatasetTableContext:
     analytical_columns: tuple[str, ...]
+    workload_context_columns: tuple[str, ...]
     categorical_values: dict[str, tuple[str, ...]]
     reciprocal_parameters: tuple[str, ...]
 
@@ -532,6 +533,11 @@ def _write_full_roi_workload_dataset(
         window_count=samples[0].labels.shape[0],
         mechanisms=config.microarchitecture.mechanisms,
     )
+    workload_context = _workload_context_values(
+        features,
+        reference_config_index=_reference_config_index(run_configs, config),
+        table_context=table_context,
+    )
     labels = np.stack([sample.labels for sample in samples], axis=1)
     if features.shape[:2] != labels.shape[:2]:
         raise ValueError(
@@ -548,6 +554,7 @@ def _write_full_roi_workload_dataset(
                 workload_id=workload_id,
                 window_index=window_index,
                 feature_values=features[window_index],
+                workload_context=workload_context,
                 labels=labels[window_index],
                 configs=run_configs,
                 config=config,
@@ -668,6 +675,42 @@ def _analytical_config(
 ) -> dict[str, int | float]:
     return dict(config.microarchitecture.analytical_values(run_config.parameter_values))
 
+
+def _reference_config_index(run_configs: tuple[RunConfig, ...], config: PeregrineConfig) -> int:
+    reference_id = config.microarchitecture.config_id({})
+    matches = [index for index, run_config in enumerate(run_configs) if run_config.config_id == reference_id]
+    if len(matches) != 1:
+        raise ValueError("full-ROI workload must contain exactly one reference config for workload context")
+    return matches[0]
+
+
+def _workload_context_values(
+    features: np.ndarray,
+    *,
+    reference_config_index: int,
+    table_context: DatasetTableContext,
+) -> np.ndarray:
+    if features.ndim != 3:
+        raise ValueError("workload context requires a window/config/feature tensor")
+    if not 0 <= reference_config_index < features.shape[1]:
+        raise ValueError("reference config index is outside the feature tensor")
+    reference = features[:, reference_config_index, :]
+    if reference.shape[0] <= 0 or not np.isfinite(reference).all():
+        raise ValueError("reference workload context features are invalid")
+    by_name = {column: index for index, column in enumerate(table_context.analytical_columns)}
+    values: list[float] = []
+    for context_column in table_context.workload_context_columns[::4]:
+        mechanism_name = context_column.rsplit("__", maxsplit=1)[1]
+        source = reference[:, by_name[f"dynamic_{mechanism_name}_mean"]]
+        values.extend((
+            float(np.mean(source)),
+            float(np.percentile(source, 90)),
+            float(np.std(source)),
+            float(np.mean(source > 0.0)),
+        ))
+    return np.asarray(values, dtype=np.float64)
+
+
 def _dataset_schema(config: PeregrineConfig) -> pa.Schema:
     return pa.schema(
         [
@@ -711,6 +754,7 @@ def _full_roi_dataset_columns(config: PeregrineConfig) -> list[str]:
 def _dataset_table_context(config: PeregrineConfig) -> DatasetTableContext:
     return DatasetTableContext(
         analytical_columns=analytical_feature_columns(config.microarchitecture.mechanisms),
+        workload_context_columns=workload_context_feature_columns(config.microarchitecture.mechanisms),
         categorical_values={
             parameter_name: _categorical_values(parameter_name, config=config)
             for parameter_name in config.categorical_design_parameter_names
@@ -727,6 +771,7 @@ def _full_roi_dataset_table(
     workload_id: str,
     window_index: int,
     feature_values: np.ndarray,
+    workload_context: np.ndarray,
     labels: np.ndarray,
     configs: tuple[RunConfig, ...],
     config: PeregrineConfig,
@@ -737,6 +782,7 @@ def _full_roi_dataset_table(
         workload_id=workload_id,
         window_index=window_index,
         feature_values=feature_values,
+        workload_context=workload_context,
         configs=configs,
         config=config,
         table_context=table_context,
@@ -756,6 +802,7 @@ def _full_roi_feature_table(
     workload_id: str,
     window_index: int,
     feature_values: np.ndarray,
+    workload_context: np.ndarray,
     configs: tuple[RunConfig, ...],
     config: PeregrineConfig,
     table_context: DatasetTableContext,
@@ -763,6 +810,8 @@ def _full_roi_feature_table(
     config_count = len(configs)
     if feature_values.shape != (config_count, len(table_context.analytical_columns)):
         raise ValueError("Anamol full-ROI feature dimensions differ from the configured contract")
+    if workload_context.shape != (len(table_context.workload_context_columns),):
+        raise ValueError("workload context dimensions differ from the configured contract")
     arrays: list[pa.Array] = [
         pa.array([workload_id] * config_count, type=pa.string()),
         pa.array([window_index] * config_count, type=pa.int64()),
@@ -808,7 +857,11 @@ def _full_roi_feature_table(
         )
         for parameter in table_context.reciprocal_parameters
     )
-    if not np.isfinite(feature_values).all():
+    arrays.extend(
+        pa.array([float(value)] * config_count, type=pa.float64())
+        for value in workload_context
+    )
+    if not np.isfinite(feature_values).all() or not np.isfinite(workload_context).all():
         raise ValueError("full-ROI feature table contains non-finite generated values")
     return pa.Table.from_arrays(
         arrays,
@@ -828,18 +881,30 @@ def build_candidate_feature_table(
     """Analyze one existing rich trace for a batch of candidate configurations."""
     features = analyze_full_roi_windows(
         trace_path=trace_path,
-        configs=tuple(_analytical_config(item, config) for item in run_configs),
+        configs=(
+            _analytical_config(
+                config.run_config_from_args(
+                    config.microarchitecture.config_id({}),
+                    config.microarchitecture.gem5_args(),
+                ),
+                config,
+            ),
+            *tuple(_analytical_config(item, config) for item in run_configs),
+        ),
         full_roi_window_size=full_roi_window_size,
         analysis_window_size=config.analysis.window_size,
         window_count=window_count,
         mechanisms=config.microarchitecture.mechanisms,
     )
     context = _dataset_table_context(config)
+    workload_context = _workload_context_values(features, reference_config_index=0, table_context=context)
+    candidate_features = features[:, 1:, :]
     return pa.concat_tables([
         _full_roi_feature_table(
             workload_id=workload_id,
             window_index=window_index,
-            feature_values=features[window_index],
+            feature_values=candidate_features[window_index],
+            workload_context=workload_context,
             configs=run_configs,
             config=config,
             table_context=context,
@@ -862,6 +927,7 @@ def _dataset_table(
     config_count = len(configs)
     if batch.values.shape != (config_count, len(table_context.analytical_columns)):
         raise ValueError("Anamol feature batch dimensions differ from the configured contract")
+    workload_context = _batch_workload_context_values(batch.values, table_context)
     arrays: list[pa.Array] = [
         pa.array([workload_id] * config_count, type=pa.string()),
         pa.array([region_id] * config_count, type=pa.string()),
@@ -910,6 +976,10 @@ def _dataset_table(
         )
         for parameter in table_context.reciprocal_parameters
     )
+    arrays.extend(
+        pa.array([float(value)] * config_count, type=pa.float64())
+        for value in workload_context
+    )
     if not np.isfinite(batch.values).all() or not np.isfinite(labels).all():
         raise ValueError("dataset table contains non-finite generated values")
     arrays.extend(
@@ -917,6 +987,13 @@ def _dataset_table(
         for index in range(labels.shape[1])
     )
     return pa.Table.from_arrays(arrays, schema=schema)
+
+
+def _batch_workload_context_values(values: np.ndarray, table_context: DatasetTableContext) -> np.ndarray:
+    if values.ndim != 2 or values.shape[0] <= 0 or not np.isfinite(values).all():
+        raise ValueError("batch workload context features are invalid")
+    expanded = values[:, np.newaxis, :]
+    return _workload_context_values(expanded, reference_config_index=0, table_context=table_context)
 
 
 
