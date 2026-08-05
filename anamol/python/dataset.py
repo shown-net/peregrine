@@ -53,7 +53,8 @@ class FullRoiConfigSample:
 class ConfigStatsSample:
     """One canonical full-ROI gem5 config artifact shared by model builders."""
 
-    config: RunConfig
+    config_id: str
+    config: RunConfig | None
     stats_path: Path
     window_count: int
 
@@ -123,6 +124,7 @@ def build_full_roi_window_dataset_shards(
 
 def load_config_stats_workload(
     *, config: PeregrineConfig, raw_root: str | Path, workload_id: str,
+    parse_configs: bool = True,
 ) -> ConfigStatsWorkload:
     """Load the single canonical raw config-stats contract for a workload.
 
@@ -158,14 +160,16 @@ def load_config_stats_workload(
                 f"config-stats window counts differ: expected {expected_windows}, "
                 f"got {window_count} at {stats_path}"
             )
-        run_config = (
-            config.run_config_from_args(reference_id, config.microarchitecture.gem5_args())
-            if config_root.name == reference_id
-            else _run_config_from_log(config_root, config)
-        )
-        if run_config.config_id != config_root.name:
-            raise ValueError(f"config-stats identity differs from artifact directory: {config_root}")
-        samples.append(ConfigStatsSample(run_config, stats_path, window_count))
+        run_config = None
+        if parse_configs:
+            run_config = (
+                config.run_config_from_args(reference_id, config.microarchitecture.gem5_args())
+                if config_root.name == reference_id
+                else _run_config_from_log(config_root, config)
+            )
+            if run_config.config_id != config_root.name:
+                raise ValueError(f"config-stats identity differs from artifact directory: {config_root}")
+        samples.append(ConfigStatsSample(config_root.name, run_config, stats_path, window_count))
     if not samples:
         raise ValueError(f"config-stats workload has no configuration artifacts: {workload_id}")
     return ConfigStatsWorkload(workload_id, reference_trace_path, tuple(samples))
@@ -499,12 +503,14 @@ def _full_roi_config_samples(
     raw = load_config_stats_workload(config=config, raw_root=raw_root, workload_id=workload_id)
     samples: list[FullRoiConfigSample] = []
     for sample in raw.samples:
+        if sample.config is None:
+            raise ValueError(f"config-stats sample lacks parsed configuration: {sample.stats_path}")
         labels = read_label_values(sample.stats_path, config.labels)
         if labels.ndim != 2 or labels.shape[1] != len(config.labels.labels) or not np.isfinite(labels).all():
             raise ValueError(f"invalid full-ROI labels: {sample.stats_path}")
         samples.append(
             FullRoiConfigSample(
-                config_id=sample.config.config_id,
+                config_id=sample.config_id,
                 config=sample.config,
                 stats_path=sample.stats_path,
                 labels=labels,

@@ -1,599 +1,495 @@
-"""Residual simulator-to-N2 calibration with Gaussian performance intervals."""
-
+"""Workload-generalizing gem5-to-PMU calibration with torch."""
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
+import json
 from pathlib import Path
 from typing import Any, Sequence
 
+import joblib
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from sklearn.model_selection import LeaveOneGroupOut, cross_val_predict
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.utils.class_weight import compute_sample_weight
 import torch
-from scipy.stats import chi2
 from torch import nn
 from torch.nn import functional as F
-
-import ot
-
-from .multitask import scale, standardize
+from torch.utils.data import DataLoader, TensorDataset
 
 
-DEFAULT_EPOCHS = 200
-DEFAULT_LEARNING_RATE = 1e-3
-DEFAULT_WEIGHT_DECAY = 1e-3
-DEFAULT_CONFIDENCE_LEVEL = 0.95
-OT_WEIGHT_CANDIDATES = (0.0, 0.03, 0.1, 0.3)
-OT_UPDATE_INTERVAL = 4
+SPARSE_ZERO_FRACTION = 0.25
+SPARSE_MIN_POSITIVES = 20
+TRAINING_EPOCHS = 60
+TRAINING_BATCH_SIZE = 256
+TRAINING_PATIENCE = 8
+TRAINING_LEARNING_RATE = 1e-3
+TRAINING_WEIGHT_DECAY = 1e-4
+RANDOM_SEED = 19
 
 
 @dataclass(frozen=True)
 class CalibratorDataset:
-    reference_config_id: str
-    workload_ids: tuple[str, ...]
-    interval_indices: np.ndarray
-    config_ids: tuple[str, ...]
-    configs: np.ndarray
-    proxy_metrics: np.ndarray
+    source_workload_ids: tuple[str, ...]
+    source_interval_indices: np.ndarray
+    source_proxy_values: np.ndarray
     target_workload_ids: tuple[str, ...]
     target_interval_indices: np.ndarray
     target_means: np.ndarray
-    target_sample_covariances: np.ndarray
-    config_names: tuple[str, ...]
-    proxy_names: tuple[str, ...]
-    output_names: tuple[str, ...]
+    target_measurement_covariances: np.ndarray
+    source_proxy_names: tuple[str, ...]
+    target_names: tuple[str, ...]
+    fingerprint: str
+    target_anchor_period: int
 
 
 @dataclass(frozen=True)
 class CalibratorInputs:
     workload_ids: tuple[str, ...]
     interval_indices: np.ndarray
-    config_ids: tuple[str, ...]
-    configs: np.ndarray
-    proxy_metrics: np.ndarray
-    config_names: tuple[str, ...]
-    proxy_names: tuple[str, ...]
+    source_proxy_values: np.ndarray
+    source_proxy_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class FittedCalibrator:
-    model: nn.Module
-    feature_mean: np.ndarray
-    feature_scale: np.ndarray
-    output_mean: np.ndarray
-    output_scale: np.ndarray
-    config_names: tuple[str, ...]
-    proxy_names: tuple[str, ...]
-    output_names: tuple[str, ...]
-    confidence_level: float
-    ot_weight: float
-    epochs: int
+    estimator: Any
+    source_proxy_names: tuple[str, ...]
+    target_names: tuple[str, ...]
+    fingerprint: str
 
 
 @dataclass(frozen=True)
 class CalibratorPrediction:
     workload_id: str
     interval_index: int
-    config_id: str
-    lower: np.ndarray
     mean: np.ndarray
-    upper: np.ndarray
 
 
 @dataclass(frozen=True)
-class _TransportGroup:
-    workload_id: str
-    config_id: str
-    source: torch.Tensor
-    target: torch.Tensor
+class HeldoutCalibratorPredictions:
+    workload_ids: tuple[str, ...]
+    interval_indices: np.ndarray
+    target_names: tuple[str, ...]
+    truth: np.ndarray
+    prediction: np.ndarray
+    baseline: np.ndarray
+    measurement_covariances: np.ndarray
 
 
-@dataclass(frozen=True)
-class _PreparedTargets:
-    means: torch.Tensor
-    covariances: torch.Tensor
-    reference_source: torch.Tensor
-    reference_target: torch.Tensor
-    reference_weights: torch.Tensor
-    groups: tuple[_TransportGroup, ...]
-
-
-@dataclass(frozen=True)
-class _PreparedCalibratorData:
-    x: torch.Tensor
-    proxy_base: torch.Tensor
-    feature_mean: np.ndarray
-    feature_scale: np.ndarray
-    output_mean: np.ndarray
-    output_scale: np.ndarray
-    targets: _PreparedTargets
-
-
-class _GaussianCalibratorModel(nn.Module):
-    """Shared residual mean trunk plus a PSD covariance head."""
-
-    def __init__(self, input_size: int, output_size: int) -> None:
-        super().__init__()
-        self.output_size = output_size
-        self.trunk = nn.Sequential(
-            nn.Linear(input_size, 32), nn.ReLU(),
-            nn.Linear(32, 16), nn.ReLU(),
-        )
-        self.mean_residual = nn.Linear(16, output_size)
-        self.covariance_factor = nn.Linear(16, output_size * (output_size + 1) // 2)
-        nn.init.zeros_(self.mean_residual.weight)
-        nn.init.zeros_(self.mean_residual.bias)
-        nn.init.zeros_(self.covariance_factor.weight)
-        nn.init.zeros_(self.covariance_factor.bias)
-        lower = torch.tril_indices(output_size, output_size)
-        diagonal_positions = torch.nonzero(lower[0] == lower[1], as_tuple=False).flatten()
-        initial_diagonal = torch.linspace(0.5, 0.9, output_size)
-        with torch.no_grad():
-            self.covariance_factor.bias[diagonal_positions] = torch.log(torch.expm1(initial_diagonal - 1e-5))
-
-    def forward(self, features: torch.Tensor, proxy_base: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        encoded = self.trunk(features)
-        mean = proxy_base + self.mean_residual(encoded)
-        packed = self.covariance_factor(encoded)
-        factor = torch.zeros((len(features), self.output_size, self.output_size), dtype=features.dtype, device=features.device)
-        lower = torch.tril_indices(self.output_size, self.output_size, device=features.device)
-        factor[:, lower[0], lower[1]] = 3.0 * torch.tanh(packed / 3.0)
-        diagonal = torch.arange(self.output_size, device=features.device)
-        factor[:, diagonal, diagonal] = F.softplus(factor[:, diagonal, diagonal]).clamp(max=3.0) + 1e-3
-        return mean, factor @ factor.transpose(-1, -2)
-
-
-def build_calibrator_dataset(
-    records: Sequence[dict[str, Any]], *, target_records: Sequence[dict[str, Any]],
-    config_names: Sequence[str], proxy_names: Sequence[str], output_names: Sequence[str],
-    reference_config_id: str, output_path: str | Path | None = None, require_reference: bool = True,
-) -> CalibratorDataset:
-    """Validate simulator views and canonical N2 performance moments."""
-    configs_names, proxies_names, outputs = tuple(config_names), tuple(proxy_names), tuple(output_names)
-    if not records or not target_records or not configs_names or not proxies_names or not outputs:
-        raise ValueError("calibrator dataset needs source rows, target rows, and metric names")
-    if len(set(configs_names)) != len(configs_names) or len(set(proxies_names)) != len(proxies_names):
-        raise ValueError("calibrator input names must be unique")
-    if set(outputs) - set(proxies_names):
-        raise ValueError("calibrator outputs must be simulator proxy metrics")
-
-    identities: set[tuple[str, int, str]] = set()
-    workloads: list[str] = []; intervals: list[int] = []; config_ids: list[str] = []
-    configs: list[np.ndarray] = []; proxies: list[np.ndarray] = []
-    for record in records:
-        workload, interval, config_id = str(record["workload_id"]), int(record["interval_index"]), str(record["config_id"])
-        identity = (workload, interval, config_id)
-        if identity in identities:
-            raise ValueError(f"duplicate calibrator identity: {identity}")
-        identities.add(identity)
-        config = np.asarray(record["config"], dtype=np.float32)
-        proxy = np.asarray(record["proxy_metrics"], dtype=np.float32)
-        if config.shape != (len(configs_names),) or proxy.shape != (len(proxies_names),):
-            raise ValueError("calibrator source record has invalid vector widths")
-        if not np.isfinite(config).all() or not np.isfinite(proxy).all() or (proxy < 0.0).any():
-            raise ValueError("calibrator source rows must be finite with nonnegative metrics")
-        workloads.append(workload); intervals.append(interval); config_ids.append(config_id); configs.append(config); proxies.append(proxy)
-
-    target_ids: set[tuple[str, int]] = set()
-    target_workloads: list[str] = []; target_intervals: list[int] = []
-    means: list[np.ndarray] = []; covariances: list[np.ndarray] = []
-    for record in target_records:
-        workload, interval = str(record["workload_id"]), int(record["interval_index"])
-        identity = (workload, interval)
-        if identity in target_ids:
-            raise ValueError(f"duplicate PMU target identity: {identity}")
-        target_ids.add(identity)
-        mean = np.asarray(record["mean"], dtype=np.float32)
-        covariance = np.asarray(record["sample_covariance"], dtype=np.float32)
-        if mean.shape != (len(outputs),) or covariance.shape != (len(outputs), len(outputs)):
-            raise ValueError("calibrator target row has invalid mean/covariance widths")
-        if not np.isfinite(mean).all() or (mean < 0.0).any() or not np.isfinite(covariance).all():
-            raise ValueError("calibrator target rows must be finite with nonnegative means")
-        _validate_covariance(covariance)
-        target_workloads.append(workload); target_intervals.append(interval); means.append(mean); covariances.append(covariance)
-
-    if {(workload, interval) for workload, interval in zip(workloads, intervals, strict=True)} - target_ids:
-        raise ValueError("calibrator source windows lack fixed-N2 PMU targets")
-    data = CalibratorDataset(
-        reference_config_id, tuple(workloads), np.asarray(intervals, dtype=np.int64), tuple(config_ids),
-        np.stack(configs), np.stack(proxies), tuple(target_workloads), np.asarray(target_intervals, dtype=np.int64),
-        np.stack(means), np.stack(covariances), configs_names, proxies_names, outputs,
+def build_calibrator_dataset(records: Sequence[dict[str, Any]], *, target_records: Sequence[dict[str, Any]], source_names: Sequence[str], target_names: Sequence[str], target_anchor_period: int) -> CalibratorDataset:
+    sources, targets = tuple(source_names), tuple(target_names)
+    if not records or not target_records or not sources or not targets or target_anchor_period <= 0:
+        raise ValueError("calibrator dataset needs source rows, mean targets, and an anchor period")
+    source_rows = _source_rows(records, len(sources))
+    target_rows = _target_rows(target_records, len(targets))
+    if {key[:2] for key in source_rows} != {key[:2] for key in target_rows}:
+        raise ValueError("source and PMU mean windows differ")
+    targets_by_key = {(workload, interval): (mean, covariance) for workload, interval, mean, covariance in target_rows}
+    aligned_targets = [(workload, interval, *targets_by_key[(workload, interval)]) for workload, interval, _ in source_rows]
+    source_payload = [{"workload_id": w, "interval_index": i, "source_proxy_values": v.tolist()} for w, i, v in source_rows]
+    target_payload = [{"workload_id": w, "interval_index": i, "mean": m.tolist(), "measurement_covariance": c.tolist()} for w, i, m, c in aligned_targets]
+    return CalibratorDataset(
+        tuple(w for w, _, _ in source_rows), np.asarray([i for _, i, _ in source_rows], dtype=np.int64), np.stack([v for _, _, v in source_rows]),
+        tuple(w for w, _, _, _ in aligned_targets), np.asarray([i for _, i, _, _ in aligned_targets], dtype=np.int64), np.stack([m for _, _, m, _ in aligned_targets]), np.stack([c for _, _, _, c in aligned_targets]),
+        sources, targets, _fingerprint(source_payload, target_payload, sources, targets, target_anchor_period), target_anchor_period,
     )
-    if require_reference:
-        _validate_reference_coverage(data)
-    if output_path is not None:
-        _write_source_dataset(data, Path(output_path))
+
+
+def write_calibrator_source(data: CalibratorDataset, path: str | Path) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    metadata = {b"calibrator_source_proxies": ",".join(data.source_proxy_names).encode(), b"calibrator_target_events": ",".join(data.target_names).encode(), b"calibrator_target_anchor_period": str(data.target_anchor_period).encode(), b"calibrator_fingerprint": data.fingerprint.encode()}
+    rows = [{"workload_id": w, "interval_index": int(i), "source_proxy_values": v.tolist()} for w, i, v in zip(data.source_workload_ids, data.source_interval_indices, data.source_proxy_values, strict=True)]
+    pq.write_table(pa.Table.from_pylist(rows).replace_schema_metadata(metadata), destination, compression="zstd")
+
+
+def load_calibrator_dataset(source_path: str | Path, target_path: str | Path) -> CalibratorDataset:
+    source, target = pq.read_table(source_path), pq.read_table(target_path)
+    metadata, target_metadata = source.schema.metadata or {}, target.schema.metadata or {}
+    raw_source, raw_target, raw_period, fingerprint = (metadata.get(b"calibrator_source_proxies"), metadata.get(b"calibrator_target_events"), metadata.get(b"calibrator_target_anchor_period"), metadata.get(b"calibrator_fingerprint"))
+    if not raw_source or not raw_target or not raw_period or not fingerprint or target_metadata.get(b"calibrator_target_provenance") != b"cross_run_mean_vector":
+        raise ValueError("source and target are not a cross-run calibrator dataset")
+    if target_metadata.get(b"calibrator_target_events") != raw_target or target_metadata.get(b"calibrator_target_anchor_period") != raw_period:
+        raise ValueError("source and PMU target contracts differ")
+    data = build_calibrator_dataset(source.to_pylist(), target_records=target.to_pylist(), source_names=raw_source.decode().split(","), target_names=raw_target.decode().split(","), target_anchor_period=int(raw_period))
+    if data.fingerprint != fingerprint.decode():
+        raise ValueError("calibrator source content differs from its fingerprint")
     return data
 
 
-def build_calibrator_inputs(records: Sequence[dict[str, Any]], *, config_names: Sequence[str], proxy_names: Sequence[str]) -> CalibratorInputs:
-    configs_names, proxies_names = tuple(config_names), tuple(proxy_names)
-    if not records or not configs_names or not proxies_names:
-        raise ValueError("calibrator inputs need records, config names, and proxy names")
-    identities: set[tuple[str, int, str]] = set()
-    workloads: list[str] = []; intervals: list[int] = []; config_ids: list[str] = []
-    configs: list[np.ndarray] = []; proxies: list[np.ndarray] = []
-    for record in records:
-        workload, interval, config_id = str(record["workload_id"]), int(record["interval_index"]), str(record["config_id"])
-        identity = (workload, interval, config_id)
-        if identity in identities:
-            raise ValueError(f"duplicate calibrator identity: {identity}")
-        identities.add(identity)
-        config = np.asarray(record["config"], dtype=np.float32)
-        proxy = np.asarray(record["proxy_metrics"], dtype=np.float32)
-        if config.shape != (len(configs_names),) or proxy.shape != (len(proxies_names),):
-            raise ValueError("calibrator input has invalid vector widths")
-        if not np.isfinite(config).all() or not np.isfinite(proxy).all() or (proxy < 0.0).any():
-            raise ValueError("calibrator inputs must be finite with nonnegative metrics")
-        workloads.append(workload); intervals.append(interval); config_ids.append(config_id); configs.append(config); proxies.append(proxy)
-    return CalibratorInputs(tuple(workloads), np.asarray(intervals, dtype=np.int64), tuple(config_ids), np.stack(configs), np.stack(proxies), configs_names, proxies_names)
+def build_calibrator_inputs(records: Sequence[dict[str, Any]], *, source_names: Sequence[str]) -> CalibratorInputs:
+    rows = _source_rows(records, len(source_names))
+    return CalibratorInputs(tuple(w for w, _, _ in rows), np.asarray([i for _, i, _ in rows], dtype=np.int64), np.stack([v for _, _, v in rows]), tuple(source_names))
 
 
-def train_calibrator(
-    dataset: CalibratorDataset | str | Path, *, output_path: str | Path | None = None,
-    epochs: int = DEFAULT_EPOCHS, learning_rate: float = DEFAULT_LEARNING_RATE,
-    weight_decay: float = DEFAULT_WEIGHT_DECAY, ot_weight: float | None = None,
-    confidence_level: float = DEFAULT_CONFIDENCE_LEVEL, seed: int = 19,
-) -> FittedCalibrator:
-    data = _coerce_dataset(dataset)
-    if epochs < 1 or learning_rate <= 0.0 or weight_decay < 0.0 or not 0.0 < confidence_level < 1.0:
-        raise ValueError("invalid calibrator training parameters")
-    chosen_weight = _select_ot_weight(data, epochs=min(epochs, 10), learning_rate=learning_rate, weight_decay=weight_decay, confidence_level=confidence_level, seed=seed) if ot_weight is None else ot_weight
-    if chosen_weight not in OT_WEIGHT_CANDIDATES:
-        raise ValueError("calibrator OT weight is not an approved candidate")
-    fitted = _fit(data, epochs=epochs, learning_rate=learning_rate, weight_decay=weight_decay, confidence_level=confidence_level, ot_weight=chosen_weight, seed=seed)
+def train_calibrator(data: CalibratorDataset, *, output_path: str | Path | None = None) -> FittedCalibrator:
+    _require_workloads(data)
+    estimator = _estimator().fit(
+        data.source_proxy_values,
+        data.target_means,
+        sample_weight=_workload_weights(data.source_workload_ids),
+        source_names=data.source_proxy_names,
+        target_names=data.target_names,
+    )
+    fitted = FittedCalibrator(estimator, data.source_proxy_names, data.target_names, data.fingerprint)
     if output_path is not None:
         _save(fitted, Path(output_path))
     return fitted
 
 
-def predict_calibrator(fitted: FittedCalibrator | str | Path, dataset: CalibratorDataset | CalibratorInputs | str | Path) -> tuple[CalibratorPrediction, ...]:
-    model, data = _coerce_fitted(fitted), _coerce_inputs(dataset)
-    if (model.config_names, model.proxy_names) != (data.config_names, data.proxy_names):
-        raise ValueError("calibrator model and dataset inputs differ")
-    means, covariances = _predict_moments(model, data)
-    radius = float(chi2.ppf(model.confidence_level, len(model.output_names)))
-    half_widths = np.sqrt(np.maximum(np.diagonal(covariances, axis1=1, axis2=2), 0.0) * radius)
-    lower = np.maximum(means - half_widths, 0.0).astype(np.float32)
-    upper = (means + half_widths).astype(np.float32)
-    return tuple(
-        CalibratorPrediction(workload, int(interval), config_id, low, mean, high)
-        for workload, interval, config_id, low, mean, high in zip(
-            data.workload_ids, data.interval_indices, data.config_ids, lower, means, upper, strict=True,
+def predict_calibrator(fitted: FittedCalibrator | str | Path, source: CalibratorDataset | CalibratorInputs) -> tuple[CalibratorPrediction, ...]:
+    model, inputs = _coerce_fitted(fitted), _coerce_inputs(source)
+    if inputs.source_proxy_names != model.source_proxy_names:
+        raise ValueError("calibrator source proxy names differ")
+    mean = np.asarray(model.estimator.predict(_source_matrix(inputs.source_proxy_values, len(model.source_proxy_names))), dtype=np.float64)
+    return tuple(CalibratorPrediction(w, int(i), point.astype(np.float64)) for w, i, point in zip(inputs.workload_ids, inputs.interval_indices, mean, strict=True))
+
+
+def heldout_calibrator_predictions(data: CalibratorDataset) -> HeldoutCalibratorPredictions:
+    _require_workloads(data)
+    groups = np.asarray(data.source_workload_ids, dtype=object)
+    prediction = cross_val_predict(
+        _estimator(), data.source_proxy_values, data.target_means,
+        groups=groups, cv=LeaveOneGroupOut(), n_jobs=1,
+        params={
+            "sample_weight": _workload_weights(data.source_workload_ids),
+            "source_names": data.source_proxy_names,
+            "target_names": data.target_names,
+        },
+    )
+    baseline = _lowo_median_baseline(data)
+    return HeldoutCalibratorPredictions(
+        workload_ids=data.target_workload_ids,
+        interval_indices=data.target_interval_indices.copy(),
+        target_names=data.target_names,
+        truth=data.target_means.copy(),
+        prediction=np.asarray(prediction, dtype=np.float64),
+        baseline=baseline,
+        measurement_covariances=data.target_measurement_covariances.copy(),
+    )
+
+
+class _SparseCalibratorNet(nn.Module):
+    def __init__(self, input_size: int, target_modes: tuple[str, ...]) -> None:
+        super().__init__()
+        hidden = max(16, min(64, input_size * 4))
+        self.target_modes = target_modes
+        self.trunk = nn.Sequential(
+            nn.Linear(input_size, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
         )
-    )
+        self.value_heads = nn.ModuleList(nn.Linear(hidden, 1) for _ in target_modes)
+        self.presence_heads = nn.ModuleList(
+            nn.Linear(hidden, 1) if mode == "sparse" else nn.Identity()
+            for mode in target_modes
+        )
 
-
-def evaluate_calibrator(dataset: CalibratorDataset | str | Path, *, ot_weight: float, folds: int = 4, seed: int = 19) -> dict[str, Any]:
-    """Workload/config out-of-domain evaluation with a fixed OT weight."""
-    if ot_weight not in OT_WEIGHT_CANDIDATES:
-        raise ValueError("calibrator OT weight is not an approved candidate")
-    data = _coerce_dataset(dataset)
-    workloads = tuple(sorted(set(data.target_workload_ids)))
-    configs = tuple(config for config in sorted(set(data.config_ids)) if config != data.reference_config_id)
-    if folds < 2 or len(workloads) < folds or len(configs) < folds:
-        raise ValueError("calibrator evaluation needs enough workload and non-reference config groups")
-    rng = np.random.default_rng(seed)
-    shuffled_workloads = list(workloads); rng.shuffle(shuffled_workloads)
-    shuffled_configs = list(configs); rng.shuffle(shuffled_configs)
-    reports: dict[str, list[dict[str, Any]]] = {"workload_ood": [], "config_ood": [], "joint_ood": []}
-    for index in range(folds):
-        held_workloads = tuple(shuffled_workloads[index::folds])
-        held_configs = tuple(shuffled_configs[index::folds])
-        train = _subset(data, excluded_workloads=held_workloads, excluded_configs=held_configs, require_reference=True)
-        fitted = _fit(train, epochs=DEFAULT_EPOCHS, learning_rate=DEFAULT_LEARNING_RATE, weight_decay=DEFAULT_WEIGHT_DECAY, confidence_level=DEFAULT_CONFIDENCE_LEVEL, ot_weight=ot_weight, seed=seed + index)
-        reports["workload_ood"].append(_moment_report(fitted, _subset(data, selected_workloads=held_workloads, excluded_configs=held_configs, require_reference=False)))
-        reports["config_ood"].append(_moment_report(fitted, _subset(data, excluded_workloads=held_workloads, selected_configs=held_configs, require_reference=False)))
-        reports["joint_ood"].append(_moment_report(fitted, _subset(data, selected_workloads=held_workloads, selected_configs=held_configs, require_reference=False)))
-    return {"protocol": "joint_workload_config_holdout", "folds": folds, **{name: _mean_reports(values, data.output_names) for name, values in reports.items()}}
-
-
-def _fit(data: CalibratorDataset, *, epochs: int, learning_rate: float, weight_decay: float, confidence_level: float, ot_weight: float, seed: int) -> FittedCalibrator:
-    prepared = _prepare_calibrator_data(data)
-    torch.manual_seed(seed)
-    model = _GaussianCalibratorModel(prepared.x.shape[1], len(data.output_names))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    ot_batches = _ot_group_batches(
-        prepared.targets.groups,
-        updates=(epochs + OT_UPDATE_INTERVAL - 1) // OT_UPDATE_INTERVAL,
-        seed=seed,
-    ) if ot_weight else ()
-    with _small_matrix_threads():
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            mean, covariance = model(prepared.x, prepared.proxy_base)
-            targets = prepared.targets
-            paired = _paired_w2_squared(
-                mean[targets.reference_source], _ot_covariances(covariance[targets.reference_source]),
-                targets.means[targets.reference_target], _ot_covariances(targets.covariances[targets.reference_target]),
-            )
-            anchor_loss = (paired * targets.reference_weights).sum()
-            if ot_weight and epoch % OT_UPDATE_INTERVAL == 0:
-                ot_loss = torch.stack([
-                    ot.gmm.gmm_ot_loss(
-                        mean[group.source], targets.means[group.target], _ot_covariances(covariance[group.source]), _ot_covariances(targets.covariances[group.target]),
-                        torch.full((len(group.source),), 1.0 / len(group.source), dtype=mean.dtype),
-                        torch.full((len(group.target),), 1.0 / len(group.target), dtype=mean.dtype),
-                    )
-                    for group in ot_batches[epoch // OT_UPDATE_INTERVAL]
-                ]).mean()
+    def forward(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = self.trunk(features)
+        values = torch.cat([head(encoded) for head in self.value_heads], dim=1)
+        presences = []
+        for mode, head in zip(self.target_modes, self.presence_heads, strict=True):
+            if mode == "sparse":
+                presences.append(head(encoded))
             else:
-                ot_loss = anchor_loss.new_zeros(())
-            (anchor_loss + ot_weight * ot_loss).backward()
-            optimizer.step()
-    model.eval()
-    return FittedCalibrator(model, prepared.feature_mean, prepared.feature_scale, prepared.output_mean, prepared.output_scale, data.config_names, data.proxy_names, data.output_names, confidence_level, ot_weight, epochs)
+                presences.append(torch.zeros((len(features), 1), dtype=features.dtype, device=features.device))
+        return values, torch.cat(presences, dim=1)
 
 
-def _prepare_calibrator_data(data: CalibratorDataset) -> _PreparedCalibratorData:
-    features = np.concatenate((data.configs, np.log1p(data.proxy_metrics)), axis=1)
-    feature_mean, feature_scale = standardize(features)
-    output_mean, output_scale = standardize(data.target_means)
-    positions = tuple(data.proxy_names.index(name) for name in data.output_names)
-    proxy_base = (data.proxy_metrics[:, positions] - output_mean) / output_scale
-    scale_matrix = np.diag(1.0 / output_scale).astype(np.float32)
-    target_covariances = np.asarray([scale_matrix @ covariance @ scale_matrix for covariance in data.target_sample_covariances], dtype=np.float32)
-    lookup = _target_lookup(data)
-    reference_source = torch.as_tensor([index for index, config in enumerate(data.config_ids) if config == data.reference_config_id], dtype=torch.long)
-    reference_target = torch.as_tensor([lookup[(data.workload_ids[index], int(data.interval_indices[index]))] for index in reference_source.tolist()], dtype=torch.long)
-    reference_workloads = tuple(data.workload_ids[index] for index in reference_source.tolist())
-    return _PreparedCalibratorData(
-        x=torch.from_numpy(scale(features, feature_mean, feature_scale)), proxy_base=torch.from_numpy(proxy_base.astype(np.float32)),
-        feature_mean=feature_mean, feature_scale=feature_scale, output_mean=output_mean, output_scale=output_scale,
-        targets=_PreparedTargets(
-            means=torch.from_numpy(((data.target_means - output_mean) / output_scale).astype(np.float32)),
-            covariances=_stabilize_covariances(torch.from_numpy(target_covariances)), reference_source=reference_source,
-            reference_target=reference_target, reference_weights=torch.from_numpy(_macro_weights(reference_workloads)),
-            groups=_transport_groups(data),
-        ),
-    )
+@dataclass(frozen=True)
+class _PreparedTargets:
+    transformed_values: np.ndarray
+    presence: np.ndarray
+    value_mean: np.ndarray
+    value_scale: np.ndarray
 
 
-def _paired_w2_squared(source_mean: torch.Tensor, source_covariance: torch.Tensor, target_mean: torch.Tensor, target_covariance: torch.Tensor) -> torch.Tensor:
-    costs = ot.gmm.dist_bures_squared(source_mean, target_mean, source_covariance, target_covariance)
-    return torch.diagonal(costs)
+class TorchSparseCalibrator(RegressorMixin, BaseEstimator):
+    def __init__(self, *, seed: int = RANDOM_SEED, shrinkage: float = 0.0) -> None:
+        self.seed = seed
+        self.shrinkage = shrinkage
+
+    def fit(
+        self,
+        x: Any,
+        y: Any,
+        sample_weight: Any | None = None,
+        source_names: Sequence[str] | None = None,
+        target_names: Sequence[str] | None = None,
+    ) -> "TorchSparseCalibrator":
+        features = _source_matrix(x, len(source_names) if source_names is not None else np.asarray(x).shape[1])
+        targets = _target_matrix(y)
+        if len(features) != len(targets):
+            raise ValueError("calibrator feature and target rows differ")
+        if not 0.0 <= float(self.shrinkage) <= 1.0:
+            raise ValueError("calibrator shrinkage must be between zero and one")
+        active = np.std(features, axis=0) > 0.0
+        if not active.any():
+            raise ValueError("calibrator source contains no varying features")
+        self.source_names = tuple(source_names or tuple(f"source_{index}" for index in range(features.shape[1])))
+        self.target_names = tuple(target_names or tuple(f"target_{index}" for index in range(targets.shape[1])))
+        self.active_mask = active
+        self.active_source_names = tuple(name for name, keep in zip(self.source_names, active, strict=True) if keep)
+        self.target_min = targets.min(axis=0).astype(np.float64)
+        self.target_max = targets.max(axis=0).astype(np.float64)
+        self.target_median = np.median(targets, axis=0).astype(np.float64)
+        self.target_modes = _target_modes(targets)
+        prepared_x = self._prepare_features_for_fit(features)
+        prepared_y = _prepare_targets(targets, self.target_modes)
+        weights = (
+            np.ones(len(features), dtype=np.float32)
+            if sample_weight is None
+            else np.asarray(sample_weight, dtype=np.float32)
+        )
+        if weights.shape != (len(features),) or not np.isfinite(weights).all() or (weights <= 0.0).any():
+            raise ValueError("calibrator sample weights must be positive")
+        self.target_value_mean = prepared_y.value_mean
+        self.target_value_scale = prepared_y.value_scale
+        self.model = _train_model(
+            prepared_x,
+            prepared_y,
+            weights,
+            target_modes=self.target_modes,
+            seed=self.seed,
+        )
+        return self
+
+    def predict(self, x: Any) -> np.ndarray:
+        features = _source_matrix(x, len(self.source_names))
+        prepared = self._prepare_features_for_predict(features)
+        self.model.eval()
+        with torch.inference_mode():
+            values, presences = self.model(torch.from_numpy(prepared))
+        transformed = values.numpy() * self.target_value_scale + self.target_value_mean
+        prediction = _inverse_targets(transformed, presences.numpy(), self.target_modes)
+        prediction = self.target_median + float(self.shrinkage) * (prediction - self.target_median)
+        return np.clip(prediction, self.target_min, self.target_max).astype(np.float64)
+
+    def _prepare_features_for_fit(self, values: np.ndarray) -> np.ndarray:
+        selected = np.log1p(values[:, self.active_mask])
+        self.feature_mean = selected.mean(axis=0, dtype=np.float64).astype(np.float32)
+        self.feature_scale = np.maximum(selected.std(axis=0, dtype=np.float64).astype(np.float32), np.float32(1.0))
+        return _scale(selected, self.feature_mean, self.feature_scale)
+
+    def _prepare_features_for_predict(self, values: np.ndarray) -> np.ndarray:
+        selected = np.log1p(values[:, self.active_mask])
+        return _scale(selected, self.feature_mean, self.feature_scale)
 
 
-def _stabilize_covariances(covariances: torch.Tensor, *, floor: float = 1e-3) -> torch.Tensor:
-    symmetric = (covariances + covariances.transpose(-1, -2)) / 2.0
-    values, vectors = torch.linalg.eigh(symmetric)
-    return (vectors * values.clamp_min(floor).unsqueeze(-2)) @ vectors.transpose(-1, -2)
+def _estimator() -> TorchSparseCalibrator:
+    return TorchSparseCalibrator()
 
 
-def _ot_covariances(covariances: torch.Tensor) -> torch.Tensor:
-    dimension = covariances.shape[-1]
-    axes = torch.arange(1, dimension + 1, dtype=covariances.dtype, device=covariances.device)
-    return (covariances + covariances.transpose(-1, -2)) / 2.0 + torch.diag(axes * 1e-3)
+def _target_modes(targets: np.ndarray) -> tuple[str, ...]:
+    modes = []
+    for column in targets.T:
+        zero_fraction = float(np.mean(np.isclose(column, 0.0, atol=1e-12)))
+        positives = int(np.count_nonzero(column > 0.0))
+        modes.append(
+            "sparse"
+            if zero_fraction >= SPARSE_ZERO_FRACTION and positives >= SPARSE_MIN_POSITIVES
+            else "dense"
+        )
+    return tuple(modes)
 
 
-@contextmanager
-def _small_matrix_threads():
-    previous = torch.get_num_threads()
+def _prepare_targets(targets: np.ndarray, target_modes: tuple[str, ...]) -> _PreparedTargets:
+    values = np.log1p(targets).astype(np.float32)
+    presence = (targets > 0.0).astype(np.float32)
+    mean = values.mean(axis=0, dtype=np.float64).astype(np.float32)
+    scale = np.maximum(values.std(axis=0, dtype=np.float64).astype(np.float32), np.float32(1.0))
+    return _PreparedTargets(_scale(values, mean, scale), presence, mean, scale)
+
+
+def _train_model(
+    features: np.ndarray,
+    targets: _PreparedTargets,
+    sample_weight: np.ndarray,
+    *,
+    target_modes: tuple[str, ...],
+    seed: int,
+) -> _SparseCalibratorNet:
+    torch.manual_seed(seed)
     torch.set_num_threads(1)
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous)
-
-
-def _transport_groups(data: CalibratorDataset) -> tuple[_TransportGroup, ...]:
-    targets_by_workload: dict[str, list[int]] = {}
-    sources_by_group: dict[tuple[str, str], list[int]] = {}
-    for index, workload in enumerate(data.target_workload_ids):
-        targets_by_workload.setdefault(workload, []).append(index)
-    for index, (workload, config) in enumerate(zip(data.workload_ids, data.config_ids, strict=True)):
-        if config != data.reference_config_id:
-            sources_by_group.setdefault((workload, config), []).append(index)
-    groups: list[_TransportGroup] = []
-    for (workload, config), source_indices in sorted(sources_by_group.items()):
-        target_indices = targets_by_workload[workload]
-        if np.sort(data.interval_indices[source_indices]).tolist() != np.sort(data.target_interval_indices[target_indices]).tolist():
-            raise ValueError("each non-reference config must cover every PMU target interval")
-        groups.append(_TransportGroup(workload, config, torch.as_tensor(source_indices, dtype=torch.long), torch.as_tensor(target_indices, dtype=torch.long)))
-    return tuple(groups)
-
-
-def _ot_group_batches(groups: Sequence[_TransportGroup], *, updates: int, seed: int, batch_size: int = 8) -> tuple[tuple[_TransportGroup, ...], ...]:
-    if not groups or updates < 1 or batch_size < 1:
-        raise ValueError("OT domain batches require groups, updates, and batch size")
-    rng = np.random.default_rng(seed)
-    batches: list[tuple[_TransportGroup, ...]] = []
-    while len(batches) < updates:
-        order = rng.permutation(len(groups))
-        for start in range(0, len(groups), batch_size):
-            batches.append(tuple(groups[index] for index in order[start:start + batch_size]))
-            if len(batches) == updates:
+    model = _SparseCalibratorNet(features.shape[1], target_modes)
+    dataset = TensorDataset(
+        torch.from_numpy(features),
+        torch.from_numpy(targets.transformed_values),
+        torch.from_numpy(targets.presence),
+        torch.from_numpy(sample_weight.reshape(-1, 1)),
+    )
+    loader = DataLoader(dataset, batch_size=min(TRAINING_BATCH_SIZE, len(features)), shuffle=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=TRAINING_LEARNING_RATE, weight_decay=TRAINING_WEIGHT_DECAY)
+    best_state: dict[str, torch.Tensor] | None = None
+    best_loss = float("inf")
+    stale = 0
+    all_x = torch.from_numpy(features)
+    all_y = torch.from_numpy(targets.transformed_values)
+    all_presence = torch.from_numpy(targets.presence)
+    all_weight = torch.from_numpy(sample_weight.reshape(-1, 1))
+    for _epoch in range(TRAINING_EPOCHS):
+        model.train()
+        for batch_x, batch_y, batch_presence, batch_weight in loader:
+            optimizer.zero_grad()
+            loss = _training_loss(model, batch_x, batch_y, batch_presence, batch_weight)
+            loss.backward()
+            optimizer.step()
+        model.eval()
+        with torch.inference_mode():
+            current = float(_training_loss(model, all_x, all_y, all_presence, all_weight))
+        if current + 1e-7 < best_loss:
+            best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
+            best_loss = current
+            stale = 0
+        else:
+            stale += 1
+            if stale >= TRAINING_PATIENCE:
                 break
-    return tuple(batches)
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model
 
 
-def _predict_moments(fitted: FittedCalibrator, data: CalibratorInputs) -> tuple[np.ndarray, np.ndarray]:
-    features = np.concatenate((data.configs, np.log1p(data.proxy_metrics)), axis=1)
-    positions = tuple(data.proxy_names.index(name) for name in fitted.output_names)
-    proxy_base = (data.proxy_metrics[:, positions] - fitted.output_mean) / fitted.output_scale
-    with torch.inference_mode():
-        mean, covariance = fitted.model(torch.from_numpy(scale(features, fitted.feature_mean, fitted.feature_scale)), torch.from_numpy(proxy_base.astype(np.float32)))
-    scale_matrix = np.diag(fitted.output_scale).astype(np.float32)
-    raw_mean = np.maximum(mean.numpy() * fitted.output_scale + fitted.output_mean, 0.0).astype(np.float32)
-    raw_covariance = np.asarray([scale_matrix @ item @ scale_matrix for item in covariance.numpy()], dtype=np.float32)
-    return raw_mean, raw_covariance
+def _training_loss(
+    model: _SparseCalibratorNet,
+    features: torch.Tensor,
+    transformed_targets: torch.Tensor,
+    presence: torch.Tensor,
+    sample_weight: torch.Tensor,
+) -> torch.Tensor:
+    values, presences = model(features)
+    losses = []
+    for index, mode in enumerate(model.target_modes):
+        weight = sample_weight.reshape(-1)
+        if mode == "sparse":
+            cls_loss = F.binary_cross_entropy_with_logits(
+                presences[:, index],
+                presence[:, index],
+                weight=weight,
+                reduction="mean",
+            )
+            positive = presence[:, index] > 0.0
+            if positive.any():
+                reg_loss = F.smooth_l1_loss(
+                    values[positive, index],
+                    transformed_targets[positive, index],
+                    reduction="none",
+                )
+                reg_loss = (reg_loss * weight[positive]).mean()
+            else:
+                reg_loss = torch.zeros((), dtype=features.dtype, device=features.device)
+            losses.append(cls_loss + reg_loss)
+        else:
+            reg_loss = F.smooth_l1_loss(
+                values[:, index],
+                transformed_targets[:, index],
+                reduction="none",
+            )
+            losses.append((reg_loss * weight).mean())
+    return torch.stack(losses).mean()
 
 
-def _moment_report(fitted: FittedCalibrator, data: CalibratorDataset) -> dict[str, Any]:
-    inputs = _coerce_inputs(data)
-    predicted_mean, predicted_covariance = _predict_moments(fitted, inputs)
-    lookup = _target_lookup(data)
-    target_indices = np.asarray([lookup[(workload, int(interval))] for workload, interval in zip(data.workload_ids, data.interval_indices, strict=True)], dtype=np.int64)
-    target_mean = data.target_means[target_indices]
-    target_covariance = data.target_sample_covariances[target_indices]
-    scale_matrix = np.diag(1.0 / fitted.output_scale).astype(np.float32)
-    predicted_mean_normalized = (predicted_mean - fitted.output_mean) / fitted.output_scale
-    target_mean_normalized = (target_mean - fitted.output_mean) / fitted.output_scale
-    predicted_covariance_normalized = np.asarray([scale_matrix @ item @ scale_matrix for item in predicted_covariance], dtype=np.float32)
-    target_covariance_normalized = np.asarray([scale_matrix @ item @ scale_matrix for item in target_covariance], dtype=np.float32)
-    w2 = _paired_w2_squared(torch.from_numpy(predicted_mean_normalized), _ot_covariances(_stabilize_covariances(torch.from_numpy(predicted_covariance_normalized))), torch.from_numpy(target_mean_normalized), _ot_covariances(_stabilize_covariances(torch.from_numpy(target_covariance_normalized)))).detach().numpy()
-    radius = float(chi2.ppf(fitted.confidence_level, len(fitted.output_names)))
-    predicted_width = np.sqrt(np.maximum(np.diagonal(predicted_covariance, axis1=1, axis2=2), 0.0) * radius)
-    target_width = np.sqrt(np.maximum(np.diagonal(target_covariance, axis1=1, axis2=2), 0.0) * radius)
-    return {
-        "w2": _macro_mean(w2, data.workload_ids),
-        "mean_error": _metric_error(target_mean, predicted_mean, fitted.output_names, data.workload_ids),
-        "interval_error": _metric_error(target_width, predicted_width, fitted.output_names, data.workload_ids),
-    }
+def _inverse_targets(values: np.ndarray, presences: np.ndarray, target_modes: tuple[str, ...]) -> np.ndarray:
+    restored = np.maximum(np.expm1(values), 0.0)
+    for index, mode in enumerate(target_modes):
+        if mode == "sparse":
+            restored[:, index] *= 1.0 / (1.0 + np.exp(-presences[:, index]))
+    return restored.astype(np.float32)
 
 
-def _mean_reports(reports: Sequence[dict[str, Any]], outputs: Sequence[str]) -> dict[str, Any]:
-    return {
-        "gaussian_w2": float(np.mean([report["w2"] for report in reports])),
-        "per_metric_mean_error": {
-            output: {name: float(np.mean([report["mean_error"][output][name] for report in reports])) for name in ("mae", "rmse")}
-            for output in outputs
-        },
-        "per_metric_interval_error": {
-            output: {name: float(np.mean([report["interval_error"][output][name] for report in reports])) for name in ("mae", "rmse")}
-            for output in outputs
-        },
-    }
+def _scale(values: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(np.clip((values - mean) / scale, -8.0, 8.0), dtype=np.float32)
 
 
-def _metric_error(actual: np.ndarray, predicted: np.ndarray, outputs: Sequence[str], workloads: Sequence[str]) -> dict[str, dict[str, float]]:
-    return {
-        output: {
-            "mae": _macro_mean(np.abs(actual[:, index] - predicted[:, index]), workloads),
-            "rmse": float(np.sqrt(_macro_mean(np.square(actual[:, index] - predicted[:, index]), workloads))),
-        }
-        for index, output in enumerate(outputs)
-    }
+def _workload_weights(workloads: Sequence[str]) -> np.ndarray:
+    return compute_sample_weight("balanced", np.asarray(workloads, dtype=object))
 
 
-def _select_ot_weight(data: CalibratorDataset, *, epochs: int, learning_rate: float, weight_decay: float, confidence_level: float, seed: int) -> float:
-    workloads = tuple(sorted(set(data.target_workload_ids)))
-    configs = tuple(config for config in sorted(set(data.config_ids)) if config != data.reference_config_id)
-    if len(workloads) < 3 or len(configs) < 2:
-        return 0.0
-    workload_validation = tuple(workloads[index::3] for index in range(3))
-    config_validation = tuple(configs[index::3] for index in range(3))
-    scores: list[tuple[float, float]] = []
-    for weight in OT_WEIGHT_CANDIDATES:
-        values: list[float] = []
-        for held_workloads, held_configs in zip(workload_validation, config_validation, strict=True):
-            train = _subset(data, excluded_workloads=held_workloads, excluded_configs=held_configs, require_reference=True)
-            fitted = _fit(train, epochs=epochs, learning_rate=learning_rate, weight_decay=weight_decay, confidence_level=confidence_level, ot_weight=weight, seed=seed)
-            test = _subset(data, selected_workloads=held_workloads, selected_configs=held_configs, require_reference=False)
-            values.append(_moment_report(fitted, test)["w2"])
-        scores.append((float(np.mean(values)), weight))
-    return min(scores)[1]
+def _lowo_median_baseline(data: CalibratorDataset) -> np.ndarray:
+    groups = np.asarray(data.target_workload_ids, dtype=object)
+    out = np.empty_like(data.target_means)
+    for train_rows, heldout_rows in LeaveOneGroupOut().split(data.target_means, groups=groups):
+        out[heldout_rows] = np.median(data.target_means[train_rows], axis=0)
+    return out
 
 
-def _macro_weights(workloads: Sequence[str]) -> np.ndarray:
-    counts = {workload: workloads.count(workload) for workload in set(workloads)}
-    return np.asarray([1.0 / (len(counts) * counts[workload]) for workload in workloads], dtype=np.float32)
+def _require_workloads(data: CalibratorDataset) -> None:
+    if len(set(data.source_workload_ids)) < 3:
+        raise ValueError("calibrator training requires at least three workloads")
 
 
-def _macro_mean(values: np.ndarray, workloads: Sequence[str]) -> float:
-    return float(np.mean([np.asarray(values)[[index for index, workload in enumerate(workloads) if workload == selected]].mean() for selected in sorted(set(workloads))]))
+def _source_rows(records: Sequence[dict[str, Any]], width: int) -> list[tuple[str, int, np.ndarray]]:
+    rows = []
+    identities = set()
+    for record in records:
+        key = str(record["workload_id"]), int(record["interval_index"])
+        if key in identities:
+            raise ValueError(f"duplicate calibrator source window: {key}")
+        identities.add(key)
+        rows.append((*key, _source_matrix(record["source_proxy_values"], width).reshape(-1)))
+    if not rows:
+        raise ValueError("calibrator inputs are empty")
+    return rows
 
 
-def _validate_covariance(covariance: np.ndarray) -> None:
-    symmetric = (covariance + covariance.T) / 2.0
-    tolerance = 1e-6 * max(1.0, float(np.abs(symmetric).max()))
-    if float(np.linalg.eigvalsh(symmetric).min()) < -tolerance:
-        raise ValueError("calibrator sample covariance is not positive semidefinite")
+def _target_rows(records: Sequence[dict[str, Any]], width: int) -> list[tuple[str, int, np.ndarray, np.ndarray]]:
+    rows = []
+    identities = set()
+    for record in records:
+        key = str(record["workload_id"]), int(record["interval_index"])
+        if key in identities:
+            raise ValueError(f"duplicate PMU mean identity: {key}")
+        identities.add(key)
+        mean = _target_matrix(record["mean"]).reshape(-1)
+        covariance = np.asarray(record["measurement_covariance"], dtype=np.float64)
+        symmetric = (covariance + covariance.T) / 2.0 if covariance.ndim == 2 else covariance
+        if mean.shape != (width,) or covariance.shape != (width, width) or not np.isfinite(covariance).all() or not np.allclose(covariance, covariance.T, rtol=1e-5, atol=1e-7) or np.linalg.eigvalsh(symmetric).min() < -1e-5:
+            raise ValueError("PMU mean/covariance has an invalid shape")
+        rows.append((*key, mean, symmetric))
+    return rows
 
 
-def _validate_reference_coverage(data: CalibratorDataset) -> None:
-    expected = set(zip(data.target_workload_ids, data.target_interval_indices, strict=True))
-    observed = {(workload, int(interval)) for workload, interval, config in zip(data.workload_ids, data.interval_indices, data.config_ids, strict=True) if config == data.reference_config_id}
-    if observed != expected:
-        raise ValueError("every calibrator target requires one reference proxy point")
+def _source_matrix(values: Any, width: int) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    matrix = matrix.reshape(1, -1) if matrix.ndim == 1 else matrix
+    if matrix.ndim != 2 or matrix.shape[1] != width or not np.isfinite(matrix).all() or (matrix < 0.0).any():
+        raise ValueError("calibrator source proxies must be finite and nonnegative")
+    return matrix
 
 
-def _target_lookup(data: CalibratorDataset) -> dict[tuple[str, int], int]:
-    return {(workload, int(interval)): index for index, (workload, interval) in enumerate(zip(data.target_workload_ids, data.target_interval_indices, strict=True))}
+def _target_matrix(values: Any) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    matrix = matrix.reshape(-1, 1) if matrix.ndim == 1 else matrix
+    if matrix.ndim != 2 or not np.isfinite(matrix).all() or (matrix < 0.0).any():
+        raise ValueError("calibrator target rates must be finite and nonnegative")
+    return matrix
 
 
-def _write_source_dataset(data: CalibratorDataset, directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    metadata = {
-        b"calibrator_config": ",".join(data.config_names).encode(), b"calibrator_proxy": ",".join(data.proxy_names).encode(),
-        b"calibrator_outputs": ",".join(data.output_names).encode(), b"calibrator_reference_config_id": data.reference_config_id.encode(),
-    }
-    source = pa.Table.from_pylist([
-        {"workload_id": workload, "interval_index": int(interval), "config_id": config, "config": values.tolist(), "proxy_metrics": proxy.tolist()}
-        for workload, interval, config, values, proxy in zip(data.workload_ids, data.interval_indices, data.config_ids, data.configs, data.proxy_metrics, strict=True)
-    ]).replace_schema_metadata(metadata)
-    pq.write_table(source, directory / "source.parquet", compression="zstd")
-
-
-def _read_dataset(directory: Path) -> CalibratorDataset:
-    source_path, target_path = directory / "source.parquet", directory / "target.parquet"
-    source = pq.read_table(source_path); target = pq.read_table(target_path)
-    metadata = source.schema.metadata or {}
-    required = (b"calibrator_config", b"calibrator_proxy", b"calibrator_outputs", b"calibrator_reference_config_id")
-    if any(not metadata.get(key) for key in required):
-        raise ValueError("source table is not a calibrator dataset")
-    target_metadata = target.schema.metadata or {}
-    if target_metadata.get(b"calibrator_target_metrics") != metadata[b"calibrator_outputs"]:
-        raise ValueError("source and target metric orders differ")
-    return build_calibrator_dataset(source.to_pylist(), target_records=target.to_pylist(), config_names=metadata[b"calibrator_config"].decode().split(","), proxy_names=metadata[b"calibrator_proxy"].decode().split(","), output_names=metadata[b"calibrator_outputs"].decode().split(","), reference_config_id=metadata[b"calibrator_reference_config_id"].decode())
+def _fingerprint(source: Sequence[dict[str, Any]], target: Sequence[dict[str, Any]], source_names: Sequence[str], target_names: Sequence[str], period: int) -> str:
+    return sha256(json.dumps({"source": source, "target": target, "source_names": list(source_names), "target_names": list(target_names), "target_anchor_period": period}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _save(fitted: FittedCalibrator, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "state": fitted.model.state_dict(), "input_size": fitted.model.trunk[0].in_features,
-        "config_names": fitted.config_names, "proxy_names": fitted.proxy_names, "outputs": fitted.output_names,
-        "feature_mean": fitted.feature_mean, "feature_scale": fitted.feature_scale,
-        "output_mean": fitted.output_mean, "output_scale": fitted.output_scale,
-        "confidence_level": fitted.confidence_level, "ot_weight": fitted.ot_weight, "epochs": fitted.epochs,
-    }, path)
-
-
-def _load(path: Path) -> FittedCalibrator:
-    saved = torch.load(path, map_location="cpu", weights_only=False)
-    outputs = tuple(saved["outputs"])
-    model = _GaussianCalibratorModel(int(saved["input_size"]), len(outputs))
-    model.load_state_dict(saved["state"]); model.eval()
-    return FittedCalibrator(model, saved["feature_mean"], saved["feature_scale"], saved["output_mean"], saved["output_scale"], tuple(saved["config_names"]), tuple(saved["proxy_names"]), outputs, float(saved["confidence_level"]), float(saved["ot_weight"]), int(saved["epochs"]))
+    joblib.dump(fitted, path)
 
 
 def load_calibrator(path: str | Path) -> FittedCalibrator:
-    return _load(Path(path))
+    fitted = joblib.load(path)
+    if not isinstance(fitted, FittedCalibrator) or not isinstance(getattr(fitted, "estimator", None), TorchSparseCalibrator):
+        raise ValueError("calibrator artifact does not use the torch sparse-head contract")
+    return fitted
 
 
-def _coerce_dataset(value: CalibratorDataset | str | Path) -> CalibratorDataset:
-    return value if isinstance(value, CalibratorDataset) else _read_dataset(Path(value))
-
-
-def _coerce_inputs(value: CalibratorDataset | CalibratorInputs | str | Path) -> CalibratorInputs:
-    if isinstance(value, CalibratorInputs):
-        return value
-    if isinstance(value, CalibratorDataset):
-        return CalibratorInputs(value.workload_ids, value.interval_indices, value.config_ids, value.configs, value.proxy_metrics, value.config_names, value.proxy_names)
-    return _coerce_inputs(_read_dataset(Path(value)))
+def _coerce_inputs(value: CalibratorDataset | CalibratorInputs) -> CalibratorInputs:
+    return CalibratorInputs(value.source_workload_ids, value.source_interval_indices, value.source_proxy_values, value.source_proxy_names) if isinstance(value, CalibratorDataset) else value
 
 
 def _coerce_fitted(value: FittedCalibrator | str | Path) -> FittedCalibrator:
-    return value if isinstance(value, FittedCalibrator) else _load(Path(value))
-
-
-def _subset(
-    data: CalibratorDataset, *, selected_workloads: Sequence[str] | None = None, excluded_workloads: Sequence[str] = (),
-    selected_configs: Sequence[str] | None = None, excluded_configs: Sequence[str] = (), require_reference: bool,
-) -> CalibratorDataset:
-    workloads = set(selected_workloads) if selected_workloads is not None else set(data.target_workload_ids)
-    workloads -= set(excluded_workloads)
-    configs = set(selected_configs) if selected_configs is not None else set(data.config_ids)
-    configs -= set(excluded_configs)
-    source = [
-        {"workload_id": workload, "interval_index": int(interval), "config_id": config, "config": values, "proxy_metrics": proxy}
-        for workload, interval, config, values, proxy in zip(data.workload_ids, data.interval_indices, data.config_ids, data.configs, data.proxy_metrics, strict=True)
-        if workload in workloads and config in configs
-    ]
-    target = [
-        {"workload_id": workload, "interval_index": int(interval), "mean": mean, "sample_covariance": covariance}
-        for workload, interval, mean, covariance in zip(data.target_workload_ids, data.target_interval_indices, data.target_means, data.target_sample_covariances, strict=True)
-        if workload in workloads
-    ]
-    return build_calibrator_dataset(source, target_records=target, config_names=data.config_names, proxy_names=data.proxy_names, output_names=data.output_names, reference_config_id=data.reference_config_id, require_reference=require_reference)
+    return value if isinstance(value, FittedCalibrator) else load_calibrator(value)
