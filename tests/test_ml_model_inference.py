@@ -30,7 +30,7 @@ from ml_model.prediction import FeatureSet
 from ml_model.prediction import PredictionTask
 from ml_model.prediction import _read_task_frame
 from ml_model.prediction import evaluate_prediction_task
-from ml_model.prediction import evaluate_random_roi_split_prediction_task
+from ml_model.prediction import evaluate_family_variant_prediction_task
 from ml_model.prediction import train_prediction_task
 from ml_model.tasks import SURROGATE_TASK_ID
 from ml_model.tasks import surrogate_task
@@ -277,6 +277,36 @@ def test_workload_grouped_evaluation_uses_shared_report_contract(tmp_path: Path)
     assert all(__import__("numpy").isfinite(errors[name]) for name in ("mae", "rmse", "mape_pct", "p90_absolute_error", "wape_pct", "smape_pct"))
 
 
+def test_family_variant_evaluation_keeps_the_third_variant_in_training(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    rows = []
+    variants = ("small", "base", "large")
+    for family in ("a", "b"):
+        for variant_index, variant in enumerate(variants):
+            workload = f"{family}__{variant}"
+            for window in range(2):
+                value = float(variant_index + window + (10 if family == "b" else 1))
+                rows.append({
+                    "workload_id": workload, "region_id": f"r{window}", "config_id": "config_0",
+                    "f0": value, "f1": value + 0.5, "label_CPI": value,
+                })
+    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
+    task = _test_task(feature_columns=("f0", "f1"), label_columns=("label_CPI",), output_metrics=("CPI",))
+    families = {f"{family}__{variant}": (family, variant) for family in ("a", "b") for variant in variants}
+
+    report = evaluate_family_variant_prediction_task(
+        task=task, dataset_dir=dataset, output_dir=tmp_path / "evaluation", workload_families=families,
+    )
+    evaluation = json.loads(Path(report["evaluation"]).read_text())
+
+    assert evaluation["protocol"] == "leave_one_family_variant_out"
+    assert len(evaluation["outer_folds"]) == 6
+    base_fold = next(fold for fold in evaluation["outer_folds"] if fold["heldout_workload"] == "a__base")
+    assert base_fold["validation_workload"] == "a__large"
+    assert "a__small" in base_fold["train_workloads"]
+
+
 def test_prediction_failure_does_not_replace_existing_output(tmp_path: Path) -> None:
     feature_columns = ("f0",)
     label_columns = ("label_CPI",)
@@ -436,36 +466,9 @@ def test_workload_grouped_evaluation_excludes_heldout_labels_from_its_prediction
     second_w0 = second_oof.loc[second_oof.workload_id == "w0", "prediction_CPI"].to_numpy()
     evaluation = json.loads(Path(first_report["evaluation"]).read_text())
     assert __import__("numpy").allclose(first_w0, second_w0)
-    assert evaluation["protocol"] == "leave_one_workload_out"
+    assert evaluation["protocol"] == "grouped_workload_kfold"
     assert evaluation["generalization_scope"] == "joint_program_microarchitecture_ood"
     assert not (tmp_path / "first-evaluation" / "predictor_bundle.json").exists()
-
-
-def test_random_roi_evaluation_reports_the_historical_id_split(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    pd.DataFrame({
-        "workload_id": [f"w{index % 3}" for index in range(20)],
-        "region_id": [f"r{index}" for index in range(20)],
-        "config_id": [f"c{index}" for index in range(20)],
-        "f0": [float(index) for index in range(20)],
-        "label_CPI": [float(index + 1) for index in range(20)],
-    }).to_parquet(dataset / "samples.parquet", index=False)
-
-    report = evaluate_random_roi_split_prediction_task(
-        task=_test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",)),
-        dataset_dir=dataset, output_dir=tmp_path / "evaluation",
-    )
-
-    evaluation = json.loads(Path(report["evaluation"]).read_text())
-    split = evaluation["split"]
-    assert evaluation["protocol"] == "random_roi_split"
-    assert evaluation["primary_metric"] == {
-        "aggregation": "roi_weighted", "metric": "mape_pct", "target": "CPI",
-    }
-    assert split["train_rows"] + split["validation_rows"] + split["test_rows"] == 20
-    assert set(evaluation["metrics"]["roi_weighted"]) == {"CPI"}
-    assert pq.read_table(report["test_predictions"]).num_rows == split["test_rows"]
 
 
 def test_config_evaluation_keeps_every_config_out_of_fit_and_validation(tmp_path: Path) -> None:

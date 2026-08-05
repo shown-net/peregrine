@@ -13,12 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .design_space import PeregrineConfig, reciprocal_feature_columns, workload_context_feature_columns
-from .feature_pipeline import (
-    FeatureBatch,
-    analyze_full_roi_windows,
-    analytical_feature_columns,
-    iter_anamol_feature_batches,
-)
+from .feature_pipeline import analyze_full_roi_windows, analytical_feature_columns
 from .gem5_stats import read_label_values
 from .run_config import RunConfig
 
@@ -76,7 +71,7 @@ class DatasetTableContext:
     reciprocal_parameters: tuple[str, ...]
 
 
-def build_full_roi_window_dataset_shards(
+def build_full_roi_dataset_shards(
     *,
     config: PeregrineConfig,
     raw_root: str | Path,
@@ -97,29 +92,97 @@ def build_full_roi_window_dataset_shards(
     if not canonical_workloads or len(set(canonical_workloads)) != len(canonical_workloads):
         raise ValueError("dataset workload selection is empty or duplicated")
     out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    for partial in out.glob("*.partial"):
-        partial.unlink()
+    base_root = out / "base"
+    components_root = out / "components"
+    aggregated_root = out / "aggregated"
+    for root in (base_root, components_root, aggregated_root):
+        root.mkdir(parents=True, exist_ok=True)
+        for partial in root.rglob("*.partial"):
+            partial.unlink()
     expected_shards = {f"{_shard_stem(workload_id)}.parquet" for workload_id in canonical_workloads}
-    for stale in out.glob("*.parquet"):
-        if stale.name not in expected_shards:
-            stale.unlink()
+    for root in (base_root, aggregated_root):
+        for stale in root.glob("*.parquet"):
+            if stale.name not in expected_shards:
+                stale.unlink()
+    for mechanism in config.microarchitecture.mechanisms:
+        component_root = components_root / mechanism.name
+        component_root.mkdir(exist_ok=True)
+        for stale in component_root.glob("*.parquet"):
+            if stale.name not in expected_shards:
+                stale.unlink()
     reports: list[dict[str, int | str]] = []
     with ThreadPoolExecutor(max_workers=min(workers, len(canonical_workloads))) as executor:
         futures = [
             executor.submit(
-                _build_full_roi_workload_dataset,
+                _build_full_roi_workload_artifacts,
                 config=config,
                 raw_root=raw,
                 workload_id=workload_id,
-                destination=out / f"{_shard_stem(workload_id)}.parquet",
+                output_root=out,
                 full_roi_window_size=full_roi_window_size,
             )
             for workload_id in canonical_workloads
         ]
         for future in futures:
             reports.append(future.result())
-    return {"dataset": str(out), "shards": sorted(expected_shards), "workloads": reports}
+    return {
+        "dataset": str(out), "base": str(base_root), "components": str(components_root),
+        "aggregated": str(aggregated_root), "shards": sorted(expected_shards), "workloads": reports,
+    }
+
+
+def rebuild_full_roi_component_shards(
+    *, config: PeregrineConfig, output_dir: str | Path, component_names: tuple[str, ...],
+    workload_ids: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Re-aggregate selected component shards after their independent regeneration.
+
+    Component generators own trace analysis.  This operation deliberately only
+    combines existing artifacts, so changing an aggregation rule never starts a
+    trace scan.
+    """
+    if not component_names or len(component_names) != len(set(component_names)):
+        raise ValueError("component rebuild selection is empty or duplicated")
+    known = {mechanism.name for mechanism in config.microarchitecture.mechanisms}
+    if not set(component_names) <= known:
+        raise ValueError("component rebuild selection is not in the configured microarchitecture")
+    root = Path(output_dir)
+    base_root = root / "base"
+    selected = tuple(workload_ids) if workload_ids is not None else tuple(
+        sorted(path.stem for path in base_root.glob("*.parquet"))
+    )
+    if not selected:
+        raise ValueError("component rebuild has no base workload shards")
+    reports = [
+        _aggregate_full_roi_workload_artifacts(config=config, workload_id=workload_id, output_root=root)
+        for workload_id in selected
+    ]
+    return {"aggregated": str(root / "aggregated"), "components": component_names, "workloads": reports}
+
+
+def regenerate_full_roi_component_shards(
+    *, config: PeregrineConfig, raw_root: str | Path, output_dir: str | Path,
+    component_names: tuple[str, ...], workload_ids: tuple[str, ...] | None = None,
+    full_roi_window_size: int = FULL_ROI_INTERVAL_INSTS,
+) -> dict[str, Any]:
+    """Re-run only selected causal components, then cheaply aggregate them."""
+    root = Path(output_dir)
+    selected = tuple(workload_ids) if workload_ids is not None else tuple(
+        sorted(path.stem for path in (root / "base").glob("*.parquet"))
+    )
+    mechanisms = tuple(
+        mechanism for mechanism in config.microarchitecture.mechanisms if mechanism.name in component_names
+    )
+    if not mechanisms or len(mechanisms) != len(component_names):
+        raise ValueError("component regeneration selection is not in the configured microarchitecture")
+    for workload_id in selected:
+        _regenerate_full_roi_workload_components(
+            config=config, raw_root=Path(raw_root), output_root=root, workload_id=workload_id,
+            mechanisms=mechanisms, full_roi_window_size=full_roi_window_size,
+        )
+    return rebuild_full_roi_component_shards(
+        config=config, output_dir=root, component_names=component_names, workload_ids=selected,
+    )
 
 
 def load_config_stats_workload(
@@ -173,78 +236,6 @@ def load_config_stats_workload(
     if not samples:
         raise ValueError(f"config-stats workload has no configuration artifacts: {workload_id}")
     return ConfigStatsWorkload(workload_id, reference_trace_path, tuple(samples))
-
-
-def build_dataset_shards(
-    *,
-    config: PeregrineConfig,
-    raw_root: str | Path,
-    output_dir: str | Path,
-    workload_ids: tuple[str, ...] | None = None,
-    manifest_path: str | Path | None = None,
-    workers: int = 24,
-) -> dict[str, Any]:
-    if workers < 1:
-        raise ValueError("dataset workers must be positive")
-    raw = Path(raw_root).resolve()
-    manifest = Path(manifest_path).resolve() if manifest_path is not None else raw / SAMPLING_MANIFEST
-    samples_by_workload = _load_manifest_samples(raw, manifest_path=manifest, config=config)
-    canonical_workloads = tuple(workload_ids) if workload_ids is not None else tuple(sorted(samples_by_workload))
-    if not canonical_workloads or len(set(canonical_workloads)) != len(canonical_workloads):
-        raise ValueError("dataset workload selection is empty or duplicated")
-    if set(canonical_workloads) - set(samples_by_workload):
-        raise ValueError("raw manifest differs from the canonical workload selection")
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    for partial in out.glob("*.partial"):
-        partial.unlink()
-    expected_shards = {
-        f"{_shard_stem(workload_id)}.parquet"
-        for workload_id in canonical_workloads
-    }
-    workload_reports: list[dict[str, int | str]] = []
-    for stale in out.glob("*.parquet"):
-        if stale.name not in expected_shards:
-            stale.unlink()
-
-    for workload_id in canonical_workloads:
-        samples, skipped = _manifest_valid_samples(samples_by_workload[workload_id], config=config)
-        shard = out / f"{_shard_stem(workload_id)}.parquet"
-        expected_rows = tuple((item.region_id, item.config.config_id) for item in samples)
-        if not expected_rows:
-            raise ValueError(f"raw dataset contains no valid samples: {workload_id}")
-        if shard.exists():
-            try:
-                _validate_dataset_shard(
-                    shard,
-                    workload_id=workload_id,
-                    config=config,
-                    expected_rows=expected_rows,
-                )
-            except (OSError, TypeError, ValueError):
-                shard.unlink()
-            else:
-                workload_reports.append({"workload_id": workload_id, "rows": len(samples), "skipped": skipped})
-                continue
-        rows = _build_workload_dataset(
-            config=config,
-            workload_id=workload_id,
-            samples=samples,
-            destination=shard,
-            workers=workers,
-        )
-        _validate_dataset_shard(
-            shard,
-            workload_id=workload_id,
-            config=config,
-            expected_rows=expected_rows,
-        )
-        workload_reports.append({"workload_id": workload_id, "rows": rows, "skipped": skipped})
-    return {
-        "dataset": str(out),
-        "shards": sorted(expected_shards),
-        "workloads": workload_reports,
-    }
 
 
 def _load_manifest_samples(
@@ -461,11 +452,11 @@ def _build_full_roi_workload_dataset(
     if not samples:
         raise ValueError(f"full-ROI workload contains no config samples: {workload_id}")
     window_count = samples[0].labels.shape[0]
-    if window_count <= 0:
-        raise ValueError(f"full-ROI workload contains no label windows: {workload_id}")
+    if window_count < 2:
+        raise ValueError(f"full-ROI workload needs one warm-up and one labeled window: {workload_id}")
     expected_rows = tuple(
         (window_index, sample.config_id)
-        for window_index in range(window_count)
+        for window_index in range(1, window_count)
         for sample in samples
     )
     if destination.exists():
@@ -479,7 +470,7 @@ def _build_full_roi_workload_dataset(
         except (OSError, TypeError, ValueError):
             destination.unlink()
         else:
-            return {"workload_id": workload_id, "rows": len(expected_rows), "configs": len(samples), "windows": window_count}
+            return {"workload_id": workload_id, "rows": len(expected_rows), "configs": len(samples), "windows": window_count - 1}
     rows = _write_full_roi_workload_dataset(
         config=config,
         workload_id=workload_id,
@@ -494,7 +485,130 @@ def _build_full_roi_workload_dataset(
         config=config,
         expected_rows=expected_rows,
     )
-    return {"workload_id": workload_id, "rows": rows, "configs": len(samples), "windows": window_count}
+    return {"workload_id": workload_id, "rows": rows, "configs": len(samples), "windows": window_count - 1}
+
+
+def _build_full_roi_workload_artifacts(
+    *, config: PeregrineConfig, raw_root: Path, workload_id: str, output_root: Path,
+    full_roi_window_size: int,
+) -> dict[str, int | str]:
+    """Create reusable base/component artifacts from one causal trace scan."""
+    aggregate = output_root / "aggregated" / f"{_shard_stem(workload_id)}.parquet"
+    report = _build_full_roi_workload_dataset(
+        config=config, raw_root=raw_root, workload_id=workload_id, destination=aggregate,
+        full_roi_window_size=full_roi_window_size,
+    )
+    source = pq.read_table(aggregate)
+    base_columns = _full_roi_base_columns(config)
+    _write_table(output_root / "base" / aggregate.name, source.select(base_columns))
+    for mechanism in config.microarchitecture.mechanisms:
+        columns = [*FULL_ROI_IDENTITY_COLUMNS, *analytical_feature_columns((mechanism,))]
+        _write_table(output_root / "components" / mechanism.name / aggregate.name, source.select(columns))
+    aggregated = _aggregate_full_roi_workload_artifacts(
+        config=config, workload_id=workload_id, output_root=output_root,
+    )
+    if not source.equals(pq.read_table(aggregated), check_metadata=False):
+        raise ValueError(f"full-ROI component aggregation differs from direct analysis: {workload_id}")
+    return report
+
+
+def _regenerate_full_roi_workload_components(
+    *, config: PeregrineConfig, raw_root: Path, output_root: Path, workload_id: str,
+    mechanisms: tuple[Any, ...], full_roi_window_size: int,
+) -> None:
+    samples = _full_roi_config_samples(config=config, raw_root=raw_root, workload_id=workload_id)
+    if not samples:
+        raise ValueError(f"full-ROI workload contains no config samples: {workload_id}")
+    features = analyze_full_roi_windows(
+        trace_path=load_config_stats_workload(config=config, raw_root=raw_root, workload_id=workload_id).reference_trace_path,
+        configs=tuple(_analytical_config(sample.config, config) for sample in samples),
+        full_roi_window_size=full_roi_window_size, analysis_window_size=config.analysis.window_size,
+        window_count=samples[0].labels.shape[0], mechanisms=mechanisms,
+    )
+    base = pq.read_table(output_root / "base" / f"{_shard_stem(workload_id)}.parquet").to_pandas()
+    expected_rows = features.shape[0] * features.shape[1]
+    if len(base) != expected_rows:
+        raise ValueError(f"full-ROI base/component row count differs: {workload_id}")
+    import pandas as pd
+
+    offset = 0
+    identities = list(FULL_ROI_IDENTITY_COLUMNS)
+    for mechanism in mechanisms:
+        columns = list(analytical_feature_columns((mechanism,)))
+        width = len(columns)
+        values = features[:, :, offset:offset + width].reshape(expected_rows, width)
+        offset += width
+        frame = pd.concat([base.loc[:, identities], pd.DataFrame(values, columns=columns)], axis=1)
+        _write_table(
+            output_root / "components" / mechanism.name / f"{_shard_stem(workload_id)}.parquet",
+            pa.Table.from_pandas(frame, preserve_index=False),
+        )
+    if offset != features.shape[2]:
+        raise ValueError("full-ROI selected component feature dimensions differ from configured contract")
+
+
+def _full_roi_base_columns(config: PeregrineConfig) -> list[str]:
+    dynamic = set(analytical_feature_columns(config.microarchitecture.mechanisms))
+    context = set(workload_context_feature_columns(config.microarchitecture.mechanisms))
+    return [
+        *FULL_ROI_IDENTITY_COLUMNS,
+        *(column for column in config.feature_columns if column not in dynamic and column not in context),
+        *config.label_columns,
+    ]
+
+
+def _aggregate_full_roi_workload_artifacts(
+    *, config: PeregrineConfig, workload_id: str, output_root: Path,
+) -> Path:
+    stem = f"{_shard_stem(workload_id)}.parquet"
+    base = pq.read_table(output_root / "base" / stem).to_pandas()
+    identities = list(FULL_ROI_IDENTITY_COLUMNS)
+    if base.duplicated(identities).any():
+        raise ValueError(f"full-ROI base artifact has duplicate identities: {workload_id}")
+    parts = [base]
+    reference_id = config.microarchitecture.config_id({})
+    context_values: dict[str, float] = {}
+    for mechanism in config.microarchitecture.mechanisms:
+        component = pq.read_table(output_root / "components" / mechanism.name / stem).to_pandas()
+        if not component.loc[:, identities].equals(base.loc[:, identities]):
+            raise ValueError(f"full-ROI component identities differ from base: {workload_id}/{mechanism.name}")
+        dynamic_columns = list(analytical_feature_columns((mechanism,)))
+        parts.append(component.loc[:, dynamic_columns])
+        reference = component.loc[component["config_id"] == reference_id, dynamic_columns]
+        if reference.empty:
+            raise ValueError(f"full-ROI component lacks reference configuration: {workload_id}/{mechanism.name}")
+        mean_column = f"dynamic_{mechanism.name}_mean"
+        values = reference[mean_column].to_numpy(dtype=np.float64)
+        context_values.update({
+            f"workload_context_mean__{mechanism.name}": float(np.mean(values)),
+            f"workload_context_p90__{mechanism.name}": float(np.percentile(values, 90)),
+            f"workload_context_std__{mechanism.name}": float(np.std(values)),
+            f"workload_context_active_ratio__{mechanism.name}": float(np.mean(values > 0.0)),
+        })
+    import pandas as pd
+
+    frame = pd.concat(parts, axis=1)
+    for column in workload_context_feature_columns(config.microarchitecture.mechanisms):
+        frame[column] = context_values[column]
+    expected = _full_roi_dataset_columns(config)
+    if tuple(frame.columns) != tuple(expected):
+        frame = frame.loc[:, expected]
+    if not np.isfinite(frame.loc[:, config.feature_columns + config.label_columns].to_numpy(dtype=np.float64)).all():
+        raise ValueError(f"full-ROI aggregation contains non-finite values: {workload_id}")
+    destination = output_root / "aggregated" / stem
+    _write_table(destination, pa.Table.from_pandas(frame, preserve_index=False).cast(_full_roi_dataset_schema(config)))
+    _validate_full_roi_dataset_shard(
+        destination, workload_id=workload_id, config=config,
+        expected_rows=tuple(zip(base.window_index.astype(int), base.config_id.astype(str), strict=True)),
+    )
+    return destination
+
+
+def _write_table(destination: Path, table: pa.Table) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    pq.write_table(table, partial, compression="zstd")
+    partial.replace(destination)
 
 
 def _full_roi_config_samples(
@@ -544,7 +658,7 @@ def _write_full_roi_workload_dataset(
         reference_config_index=_reference_config_index(run_configs, config),
         table_context=table_context,
     )
-    labels = np.stack([sample.labels for sample in samples], axis=1)
+    labels = np.stack([sample.labels[1:] for sample in samples], axis=1)
     if features.shape[:2] != labels.shape[:2]:
         raise ValueError(
             f"full-ROI feature/label window dimensions differ for {workload_id}: "
@@ -555,13 +669,13 @@ def _write_full_roi_workload_dataset(
     writer = pq.ParquetWriter(partial, schema, compression="zstd")
     rows = 0
     try:
-        for window_index in range(features.shape[0]):
+        for feature_index, window_index in enumerate(range(1, samples[0].labels.shape[0])):
             table = _full_roi_dataset_table(
                 workload_id=workload_id,
                 window_index=window_index,
-                feature_values=features[window_index],
+                feature_values=features[feature_index],
                 workload_context=workload_context,
-                labels=labels[window_index],
+                labels=labels[feature_index],
                 configs=run_configs,
                 config=config,
                 schema=schema,
@@ -909,13 +1023,13 @@ def build_candidate_feature_table(
         _full_roi_feature_table(
             workload_id=workload_id,
             window_index=window_index,
-            feature_values=candidate_features[window_index],
+            feature_values=candidate_features[feature_index],
             workload_context=workload_context,
             configs=run_configs,
             config=config,
             table_context=context,
         )
-        for window_index in range(window_count)
+        for feature_index, window_index in enumerate(range(1, window_count))
     ])
 
 

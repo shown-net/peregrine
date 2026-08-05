@@ -2,713 +2,393 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deque>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
-
-#include "models.h"
+#include <utility>
 
 namespace analytical {
 namespace {
 
 constexpr size_t kFeaturesPerDistribution = 101;
 
-struct Window {
-  size_t start;
-  size_t end;
-};
-
-struct WindowCounts {
-  uint32_t int_alu = 0;
-  uint32_t int_mult_div = 0;
-  uint32_t fp = 0;
-  uint32_t fp_mult_div = 0;
-  uint32_t load = 0;
-  uint32_t store = 0;
-};
-
-struct PreparedTrace {
-  std::vector<Window> windows;
-  std::vector<WindowCounts> counts;
-};
-
-struct LatencyOverlay {
-  std::vector<latency_t> fetch;
-  std::vector<latency_t> exe;
-};
-
-struct ActiveTrace {
-  const std::vector<Instr>& instrs;
-  const LatencyOverlay* latencies = nullptr;
-
-  const Instr& instr(size_t index) const {
-    return instrs[index];
-  }
-
-  latency_t fetch_latency(size_t index) const {
-    return latencies ? latencies->fetch[index] : instrs[index].fetch_latency;
-  }
-
-  latency_t exe_latency(size_t index) const {
-    return latencies ? latencies->exe[index] : instrs[index].exe_latency;
-  }
-};
-
 uint16_t require_u16(const ConfigValues& config, const std::string& name) {
-  const auto it = config.find(name);
-  if (it == config.end())
-    throw std::runtime_error("Anamol config is missing parameter: " + name);
-  const double value = it->second;
-  if (!std::isfinite(value) || value <= 0.0 ||
-      value > static_cast<double>(UINT16_MAX) ||
-      std::floor(value) != value)
-    throw std::runtime_error("Anamol parameter must be a positive integer: " +
-                             name);
-  return static_cast<uint16_t>(value);
+  const auto found = config.find(name);
+  if (found == config.end() || !std::isfinite(found->second) ||
+      found->second <= 0.0 || found->second > UINT16_MAX ||
+      std::floor(found->second) != found->second)
+    throw std::runtime_error("Anamol parameter must be a positive integer: " + name);
+  return static_cast<uint16_t>(found->second);
 }
 
 uint64_t require_u64(const ConfigValues& config, const std::string& name) {
-  return static_cast<uint64_t>(require_u16(config, name));
+  return require_u16(config, name);
 }
 
-struct CacheConfig {
-  uint64_t line_bytes;
-  uint64_t sets;
-  uint64_t associativity;
-  uint64_t latency;
-};
+struct CacheConfig { uint64_t line_bytes, sets, associativity, latency; };
 
 class LruCache {
  public:
-  explicit LruCache(CacheConfig config) : config_(config) {
-    if (config_.line_bytes == 0 || config_.sets == 0 ||
-        config_.associativity == 0 || config_.latency == 0)
-      throw std::runtime_error("invalid Anamol cache configuration");
-  }
-
-  bool access(uint64_t address) {
-    const uint64_t line = address / config_.line_bytes;
+  explicit LruCache(CacheConfig config) : config_(config) {}
+  bool access(uint64_t line) {
     const uint64_t set = line % config_.sets;
     auto& lines = sets_[set];
-    auto found = std::find(lines.begin(), lines.end(), line);
+    const auto found = std::find(lines.begin(), lines.end(), line);
     if (found != lines.end()) {
       std::rotate(lines.begin(), found, found + 1);
       return true;
     }
     lines.insert(lines.begin(), line);
-    if (lines.size() > config_.associativity) {
-      lines.pop_back();
-    }
+    if (lines.size() > config_.associativity) lines.pop_back();
     return false;
   }
-
-  uint64_t latency() const {
-    return config_.latency;
-  }
-
+  uint64_t latency() const { return config_.latency; }
  private:
   CacheConfig config_;
   std::unordered_map<uint64_t, std::vector<uint64_t>> sets_;
 };
 
-struct CacheHierarchy {
-  LruCache l1i;
-  LruCache l1d;
-  LruCache l2;
-  uint64_t dram_latency;
-
-  uint64_t access_instruction(uint64_t address) {
-    return access_l1(address, l1i);
-  }
-
-  uint64_t access_data(uint64_t address) {
-    return access_l1(address, l1d);
-  }
-
- private:
-  uint64_t access_l1(uint64_t address, LruCache& l1) {
-    uint64_t latency = l1.latency();
-    if (l1.access(address))
-      return latency;
-    latency += l2.latency();
-    if (l2.access(address))
-      return latency;
-    return latency + dram_latency;
-  }
-};
-
-CacheConfig cache_config(const ConfigValues& config, const std::string& size_key,
-                         const std::string& assoc_key,
-                         const std::string& latency_key) {
+CacheConfig cache_config(const ConfigValues& config, const std::string& size,
+                         const std::string& assoc, const std::string& latency) {
   const uint64_t line_bytes = require_u64(config, "line_bytes");
-  const uint64_t size_kb = require_u64(config, size_key);
-  const uint64_t associativity = require_u64(config, assoc_key);
-  const uint64_t bytes = size_kb * 1024ULL;
+  const uint64_t associativity = require_u64(config, assoc);
+  const uint64_t bytes = require_u64(config, size) * 1024ULL;
   if (bytes < line_bytes * associativity)
-    throw std::runtime_error("Anamol cache size is smaller than one set: " +
-                             size_key);
-  return CacheConfig{
-      line_bytes,
-      std::max<uint64_t>(1, bytes / (line_bytes * associativity)),
-      associativity,
-      require_u64(config, latency_key),
-  };
+    throw std::runtime_error("Anamol cache size is smaller than one set: " + size);
+  return {line_bytes, std::max<uint64_t>(1, bytes / (line_bytes * associativity)),
+          associativity, require_u64(config, latency)};
 }
 
-LatencyOverlay annotate_cache_latencies(
-    const std::vector<Instr>& instrs,
-    const ConfigValues& config) {
-  LatencyOverlay out;
-  out.fetch.resize(instrs.size());
-  out.exe.resize(instrs.size());
-  CacheHierarchy caches{
-      LruCache(cache_config(
-          config, "l1i_size", "l1_associativity", "l1i_data_latency")),
-      LruCache(cache_config(
-          config, "l1d_size", "l1_associativity", "l1d_data_latency")),
-      LruCache(cache_config(
-          config, "l2_size", "l2_associativity", "l2_data_latency")),
-      require_u64(config, "dram_latency_cycles"),
-  };
+struct AccessResult { uint64_t latency; bool l1_miss; bool l2_miss; uint64_t line; };
 
-  for (size_t index = 0; index < instrs.size(); ++index) {
-    const auto& instr = instrs[index];
-    out.fetch[index] = static_cast<latency_t>(
-        std::min<uint64_t>(UINT16_MAX, caches.access_instruction(instr.IP)));
-    uint64_t memory_latency = 0;
-    if (instr.is_load && instr.read_address != 0) {
-      memory_latency = caches.access_data(instr.read_address);
-    } else if (instr.is_store && instr.write_address != 0) {
-      memory_latency = caches.access_data(instr.write_address);
-    }
-    out.exe[index] = static_cast<latency_t>(
-        std::min<uint64_t>(UINT16_MAX,
-                           static_cast<uint64_t>(instr.exe_latency) +
-                               memory_latency));
+class CacheHierarchy {
+ public:
+  explicit CacheHierarchy(const ConfigValues& config)
+      : line_bytes_(require_u64(config, "line_bytes")),
+        l1i_(cache_config(config, "l1i_size", "l1_associativity", "l1i_data_latency")),
+        l1d_(cache_config(config, "l1d_size", "l1_associativity", "l1d_data_latency")),
+        l2_(cache_config(config, "l2_size", "l2_associativity", "l2_data_latency")),
+        dram_(require_u64(config, "dram_latency_cycles")) {}
+  AccessResult instruction(uint64_t address) { return access(address, l1i_); }
+  AccessResult data(uint64_t address) { return access(address, l1d_); }
+  uint64_t line_bytes() const { return line_bytes_; }
+ private:
+  AccessResult access(uint64_t address, LruCache& l1) {
+    const uint64_t line = address / line_bytes_;
+    const uint64_t latency = l1.latency();
+    if (l1.access(line)) return {latency, false, false, line};
+    uint64_t total = latency + l2_.latency();
+    const bool l2_miss = !l2_.access(line);
+    if (l2_miss) total += dram_;
+    return {total, true, l2_miss, line};
   }
-  return out;
-}
-
-PreparedTrace prepare_trace(const std::vector<Instr>& instrs, int window_size) {
-  PreparedTrace prepared;
-  const size_t count = instrs.size();
-  const size_t step = static_cast<size_t>(window_size);
-  const size_t num_windows = (count + step - 1) / step;
-  prepared.windows.reserve(num_windows);
-  prepared.counts.reserve(num_windows);
-  for (size_t start = 0; start < count; start += step) {
-    const size_t end = std::min(start + step, count);
-    WindowCounts counts;
-    for (size_t index = start; index < end; ++index) {
-      const auto& instr = instrs[index];
-      counts.int_alu += instr.is_alu;
-      counts.int_mult_div += instr.is_alu_mult_div;
-      counts.fp += instr.is_fp;
-      counts.fp_mult_div += instr.is_fp_mult_div;
-      counts.load += instr.is_load;
-      counts.store += instr.is_store;
-    }
-    prepared.windows.push_back({start, end});
-    prepared.counts.push_back(counts);
-  }
-  return prepared;
-}
-
-PreparedTrace prepare_trace_range(
-    const std::vector<Instr>& instrs,
-    size_t range_start,
-    size_t range_end,
-    int window_size) {
-  if (range_start > range_end || range_end > instrs.size())
-    throw std::runtime_error("invalid Anamol trace window range");
-  PreparedTrace prepared;
-  const size_t step = static_cast<size_t>(window_size);
-  const size_t count = range_end - range_start;
-  const size_t num_windows = (count + step - 1) / step;
-  prepared.windows.reserve(num_windows);
-  prepared.counts.reserve(num_windows);
-  for (size_t start = range_start; start < range_end; start += step) {
-    const size_t end = std::min(start + step, range_end);
-    WindowCounts counts;
-    for (size_t index = start; index < end; ++index) {
-      const auto& instr = instrs[index];
-      counts.int_alu += instr.is_alu;
-      counts.int_mult_div += instr.is_alu_mult_div;
-      counts.fp += instr.is_fp;
-      counts.fp_mult_div += instr.is_fp_mult_div;
-      counts.load += instr.is_load;
-      counts.store += instr.is_store;
-    }
-    prepared.windows.push_back({start, end});
-    prepared.counts.push_back(counts);
-  }
-  return prepared;
-}
-
-double count_bound(size_t window_size, uint32_t count, uint16_t width) {
-  if (count == 0)
-    return static_cast<double>(window_size);
-  double cycles_needed = static_cast<double>(count) / width;
-  if (cycles_needed < 1.0)
-    cycles_needed = 1.0;
-  return static_cast<double>(window_size) / cycles_needed;
-}
-
-double width_bound(size_t window_size, uint16_t width) {
-  (void)window_size;
-  return static_cast<double>(width);
-}
-
-double load_store_ports_bound(size_t window_size, const WindowCounts& counts,
-                              uint16_t rdwr, uint16_t read) {
-  if (counts.load == 0 && counts.store == 0)
-    return static_cast<double>(window_size);
-  const double total_cycles =
-      static_cast<double>(counts.load + counts.store) / (rdwr + read);
-  const double lower_cycles =
-      static_cast<double>(counts.load) / (rdwr + read) +
-      static_cast<double>(counts.store) / rdwr;
-  const double store_cycles = static_cast<double>(counts.store) / rdwr;
-  const double loads_via_read = store_cycles * read;
-  const double remaining_loads =
-      std::max(0.0, static_cast<double>(counts.load) - loads_via_read);
-  const double upper_cycles = store_cycles + remaining_loads / (rdwr + read);
-  const double cycles = (total_cycles + lower_cycles + upper_cycles) / 3.0;
-  return static_cast<double>(window_size) / cycles;
-}
-
-uint64_t resp_cycle_range(uint64_t req_cycle, const ActiveTrace& trace,
-                          size_t instr_index,
-                          std::unordered_map<uint64_t, uint64_t>& last_req,
-                          std::unordered_map<uint64_t, uint64_t>& last_resp) {
-  const auto& instr = trace.instr(instr_index);
-  if (!instr.is_load) {
-    return req_cycle + trace.exe_latency(instr_index);
-  }
-  if (instr.read_address == 0) {
-    return req_cycle + trace.exe_latency(instr_index);
-  }
-  const uint64_t cache_line = instr.read_address / 64;
-  const uint64_t previous = last_resp[cache_line];
-  const uint64_t response =
-      std::max(req_cycle + static_cast<uint64_t>(trace.exe_latency(instr_index)), previous);
-  last_req[cache_line] = req_cycle;
-  last_resp[cache_line] = response;
-  return response;
-}
-
-double rob_range(const ActiveTrace& trace, const Window& window,
-                 uint16_t rob_size) {
-  const size_t count = window.end - window.start;
-  std::vector<uint64_t> arrival(count);
-  std::vector<uint64_t> finish(count);
-  std::vector<uint64_t> commit(count);
-  std::unordered_map<uint64_t, uint64_t> last_req;
-  std::unordered_map<uint64_t, uint64_t> last_resp;
-  const instr_id_t first = trace.instr(window.start).id;
-  for (size_t offset = 0; offset < count; ++offset) {
-    const size_t instr_index = window.start + offset;
-    const auto& instr = trace.instr(instr_index);
-    arrival[offset] = offset < rob_size ? 0 : commit[offset - rob_size];
-    uint64_t start_cycle = arrival[offset];
-    for (instr_id_t dep : instr.deps) {
-      const int dep_index = static_cast<int>(dep - first);
-      if (dep_index >= 0 && dep_index < static_cast<int>(offset)) {
-        start_cycle = std::max(start_cycle, finish[dep_index]);
-      }
-    }
-    finish[offset] = resp_cycle_range(start_cycle, trace, instr_index, last_req, last_resp);
-    commit[offset] =
-        offset == 0 ? finish[offset] : std::max(finish[offset], commit[offset - 1]);
-  }
-  return commit.back() == 0 ? static_cast<double>(count)
-                            : static_cast<double>(count) / commit.back();
-}
-
-template <typename Predicate>
-double queue_range(const ActiveTrace& trace, const Window& window,
-                   uint16_t entries, Predicate predicate) {
-  std::vector<size_t> items;
-  items.reserve(window.end - window.start);
-  for (size_t index = window.start; index < window.end; ++index) {
-    if (predicate(trace.instr(index))) {
-      items.push_back(index);
-    }
-  }
-  if (items.empty()) {
-    return static_cast<double>(window.end - window.start);
-  }
-  std::vector<uint64_t> arrival(items.size());
-  std::vector<uint64_t> finish(items.size());
-  std::vector<uint64_t> commit(items.size());
-  std::unordered_map<uint64_t, uint64_t> last_req;
-  std::unordered_map<uint64_t, uint64_t> last_resp;
-  for (size_t index = 0; index < items.size(); ++index) {
-    arrival[index] = index < entries ? 0 : commit[index - entries];
-    finish[index] = resp_cycle_range(arrival[index], trace, items[index], last_req, last_resp);
-    commit[index] =
-        index == 0 ? finish[index] : std::max(finish[index], commit[index - 1]);
-  }
-  return commit.back() == 0
-             ? static_cast<double>(window.end - window.start)
-             : static_cast<double>(window.end - window.start) / commit.back();
-}
-
-double icache_range(const ActiveTrace& trace, const Window& window,
-                    uint16_t max_icache_fills) {
-  std::unordered_map<uint64_t, uint64_t> in_flight;
-  uint64_t previous_ready = 0;
-  for (size_t index = window.start; index < window.end; ++index) {
-    const auto& instr = trace.instr(index);
-    const uint64_t cache_line = instr.IP / 64;
-    const auto found = in_flight.find(cache_line);
-    if (found != in_flight.end()) {
-      previous_ready = std::max(previous_ready, found->second);
-      continue;
-    }
-    uint64_t next_available = previous_ready;
-    while (in_flight.size() >= max_icache_fills) {
-      auto earliest = std::min_element(
-          in_flight.begin(), in_flight.end(),
-          [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-      next_available = earliest->second;
-      in_flight.erase(earliest);
-    }
-    const uint64_t start = std::max(previous_ready, next_available);
-    const uint64_t done = start + trace.fetch_latency(index);
-    in_flight[cache_line] = done;
-    previous_ready = done;
-  }
-  const size_t count = window.end - window.start;
-  return previous_ready == 0 ? static_cast<double>(count)
-                             : static_cast<double>(count) / previous_ready;
-}
-
-using ModelEvaluator = double (*)(
-    const PreparedTrace& prepared,
-    const ActiveTrace& active_trace,
-    const Window& window,
-    size_t window_index,
-    const ConfigValues& config,
-    const MechanismBinding& binding);
-
-struct ModelSpec {
-  const char* name;
-  size_t param_count;
-  bool requires_cache_annotation;
-  ModelEvaluator evaluate;
+  uint64_t line_bytes_;
+  LruCache l1i_, l1d_, l2_;
+  uint64_t dram_;
 };
-
-double eval_issue_width(const PreparedTrace& prepared,
-                        const ActiveTrace& active_trace,
-                        const Window& window, size_t window_index,
-                        const ConfigValues& config,
-                        const MechanismBinding& binding) {
-  (void)active_trace;
-  const auto& param = binding.params[0];
-  const uint16_t width = require_u16(config, param);
-  const auto& counts = prepared.counts[window_index];
-  const size_t window_size = window.end - window.start;
-  if (param == "int_reg_issue_width")
-    return count_bound(window_size, counts.int_alu, width);
-  if (param == "int_mult_div_issue_width")
-    return count_bound(window_size, counts.int_mult_div, width);
-  if (param == "fp_reg_issue_width")
-    return count_bound(window_size, counts.fp, width);
-  if (param == "fp_mult_div_issue_width")
-    return count_bound(window_size, counts.fp_mult_div, width);
-  throw std::runtime_error("unknown issue-width Anamol parameter: " + param);
-}
-
-double eval_load_store_ports(const PreparedTrace& prepared,
-                             const ActiveTrace& active_trace,
-                             const Window& window, size_t window_index,
-                             const ConfigValues& config,
-                             const MechanismBinding& binding) {
-  (void)active_trace;
-  return load_store_ports_bound(
-      window.end - window.start,
-      prepared.counts[window_index],
-      require_u16(config, binding.params[0]),
-      require_u16(config, binding.params[1]));
-}
-
-double eval_width(const PreparedTrace& prepared,
-                  const ActiveTrace& active_trace, const Window& window,
-                  size_t window_index, const ConfigValues& config,
-                  const MechanismBinding& binding) {
-  (void)prepared;
-  (void)active_trace;
-  (void)window_index;
-  return width_bound(window.end - window.start,
-                     require_u16(config, binding.params[0]));
-}
-
-double eval_rob(const PreparedTrace& prepared,
-                const ActiveTrace& active_trace, const Window& window,
-                size_t window_index, const ConfigValues& config,
-                const MechanismBinding& binding) {
-  (void)prepared;
-  (void)window_index;
-  return rob_range(active_trace, window, require_u16(config, binding.params[0]));
-}
-
-double eval_load_queue(const PreparedTrace& prepared,
-                       const ActiveTrace& active_trace,
-                       const Window& window, size_t window_index,
-                       const ConfigValues& config,
-                       const MechanismBinding& binding) {
-  (void)prepared;
-  (void)window_index;
-  return queue_range(active_trace, window, require_u16(config, binding.params[0]),
-                     [](const Instr& instr) { return instr.is_load; });
-}
-
-double eval_store_queue(const PreparedTrace& prepared,
-                        const ActiveTrace& active_trace,
-                        const Window& window, size_t window_index,
-                        const ConfigValues& config,
-                        const MechanismBinding& binding) {
-  (void)prepared;
-  (void)window_index;
-  return queue_range(active_trace, window, require_u16(config, binding.params[0]),
-                     [](const Instr& instr) { return instr.is_store; });
-}
-
-double eval_icache_fills(const PreparedTrace& prepared,
-                         const ActiveTrace& active_trace,
-                         const Window& window, size_t window_index,
-                         const ConfigValues& config,
-                         const MechanismBinding& binding) {
-  (void)prepared;
-  (void)window_index;
-  return icache_range(active_trace, window, require_u16(config, binding.params[0]));
-}
-
-const std::vector<ModelSpec>& model_specs() {
-  static const std::vector<ModelSpec> specs = {
-      {"rob_capacity_latency_bound", 1, true, eval_rob},
-      {"load_queue_capacity_latency_bound", 1, true, eval_load_queue},
-      {"store_queue_capacity_latency_bound", 1, true, eval_store_queue},
-      {"issue_width_count_bound", 1, false, eval_issue_width},
-      {"load_store_port_combined_bound", 2, false, eval_load_store_ports},
-      {"width_bound", 1, false, eval_width},
-      {"icache_fill_slots_bound", 1, true, eval_icache_fills},
-  };
-  return specs;
-}
-
-const ModelSpec& model_spec(const MechanismBinding& binding) {
-  const auto& specs = model_specs();
-  const auto found = std::find_if(
-      specs.begin(), specs.end(),
-      [&](const ModelSpec& spec) { return binding.model == spec.name; });
-  if (found == specs.end())
-    throw std::runtime_error("unknown Anamol mechanism model: " + binding.model);
-  if (binding.params.size() != found->param_count)
-    throw std::runtime_error(binding.model + " requires " +
-                             std::to_string(found->param_count) +
-                             " parameter(s): " + binding.name);
-  return *found;
-}
-
-std::vector<double> component_samples(
-    const PreparedTrace& prepared,
-    const ActiveTrace& active_trace,
-    const MechanismBinding& binding,
-    const ConfigValues& config) {
-  const ModelSpec& spec = model_spec(binding);
-  std::vector<double> samples;
-  samples.reserve(prepared.windows.size());
-  for (size_t index = 0; index < prepared.windows.size(); ++index) {
-    const auto& window = prepared.windows[index];
-    samples.push_back(
-        spec.evaluate(prepared, active_trace, window, index, config, binding));
-  }
-  return samples;
-}
 
 std::vector<double> distribution_features(std::vector<double> values) {
   if (values.empty()) values.push_back(0.0);
   std::sort(values.begin(), values.end());
-  auto percentile = [&](double point) {
+  const auto percentile = [&](double point) {
     const double rank = (values.size() - 1) * point;
     const size_t lower = static_cast<size_t>(std::floor(rank));
     const size_t upper = static_cast<size_t>(std::ceil(rank));
     return values[lower] + (rank - lower) * (values[upper] - values[lower]);
   };
-
-  std::vector<double> output;
-  output.reserve(kFeaturesPerDistribution);
+  std::vector<double> out;
+  out.reserve(kFeaturesPerDistribution);
+  for (size_t index = 0; index < 50; ++index)
+    out.push_back(percentile((static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0));
+  double weight = 0.0;
+  for (double value : values) weight += std::max(0.0, value);
   for (size_t index = 0; index < 50; ++index) {
-    const double point =
-        (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
-    output.push_back(percentile(point));
-  }
-
-  double total_weight = 0.0;
-  for (double value : values) total_weight += std::max(0.0, value);
-  if (total_weight == 0.0) {
-    output.insert(output.end(), output.begin(), output.begin() + 50);
-  } else {
-    std::vector<double> cumulative;
-    std::vector<double> weighted_values;
-    double running = 0.0;
-    for (double value : values) {
-      const double weight = std::max(0.0, value);
-      if (weight == 0.0) continue;
-      running += weight / total_weight;
-      cumulative.push_back(running);
-      weighted_values.push_back(value);
+    const double point = (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
+    if (weight == 0.0) { out.push_back(percentile(point)); continue; }
+    const double target = point * weight;
+    double cumulative = 0.0;
+    size_t selected = values.size() - 1;
+    for (size_t value = 0; value < values.size(); ++value) {
+      cumulative += std::max(0.0, values[value]);
+      if (cumulative >= target) { selected = value; break; }
     }
-    for (size_t index = 0; index < 50; ++index) {
-      const double target =
-          (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
-      const auto upper =
-          std::lower_bound(cumulative.begin(), cumulative.end(), target);
-      if (upper == cumulative.begin()) {
-        output.push_back(weighted_values.front());
-      } else if (upper == cumulative.end()) {
-        output.push_back(weighted_values.back());
-      } else {
-        const size_t right = static_cast<size_t>(upper - cumulative.begin());
-        const size_t left = right - 1;
-        const double span = cumulative[right] - cumulative[left];
-        const double alpha =
-            span == 0.0 ? 0.0 : (target - cumulative[left]) / span;
-        output.push_back(weighted_values[left] +
-                         alpha * (weighted_values[right] -
-                                  weighted_values[left]));
+    out.push_back(values[selected]);
+  }
+  out.push_back(std::accumulate(values.begin(), values.end(), 0.0) / values.size());
+  return out;
+}
+
+struct WindowCounts { uint64_t int_alu=0, int_mult_div=0, fp=0, fp_mult_div=0, load=0, store=0, micro_ops=0; };
+
+class ProgressState {
+ public:
+  double readout(size_t macro_count) {
+    const uint64_t delta = progress_ - observed_;
+    observed_ = progress_;
+    return delta == 0 ? static_cast<double>(macro_count)
+                      : static_cast<double>(macro_count) / delta;
+  }
+ protected:
+  uint64_t progress_ = 0, observed_ = 0;
+};
+
+class QueueState : public ProgressState {
+ public:
+  explicit QueueState(uint16_t entries) : commits_(entries, 0) {}
+  void process(const MicroOp& op, uint64_t latency, const std::vector<std::pair<uint64_t, uint64_t>>& lines,
+               bool dependencies) {
+    const uint64_t arrival = count_ < commits_.size() ? 0 : commits_[count_ % commits_.size()];
+    uint64_t start = arrival;
+    if (dependencies) {
+      for (const instr_id_t dependency : op.deps) {
+        const auto found = finishes_.find(dependency);
+        if (found != finishes_.end()) start = std::max(start, found->second);
       }
     }
+    uint64_t finish = start + latency;
+    for (const auto& [line, line_latency] : lines) {
+      const uint64_t response = std::max(start + line_latency, responses_[line]);
+      responses_[line] = response;
+      finish = std::max(finish, response);
+    }
+    const uint64_t commit = std::max(finish, previous_commit_);
+    commits_[count_ % commits_.size()] = commit;
+    previous_commit_ = commit;
+    ++count_;
+    progress_ = commit;
+    if (dependencies) finishes_[op.id] = finish;
+    retire(arrival);
   }
+ private:
+  void retire(uint64_t frontier) {
+    for (auto it = finishes_.begin(); it != finishes_.end();) {
+      if (it->second <= frontier) it = finishes_.erase(it); else ++it;
+    }
+    for (auto it = responses_.begin(); it != responses_.end();) {
+      if (it->second <= frontier) it = responses_.erase(it); else ++it;
+    }
+  }
+  std::vector<uint64_t> commits_;
+  uint64_t count_ = 0, previous_commit_ = 0;
+  std::unordered_map<instr_id_t, uint64_t> finishes_;
+  std::unordered_map<uint64_t, uint64_t> responses_;
+};
 
-  const double sum = std::accumulate(values.begin(), values.end(), 0.0);
-  output.push_back(sum / static_cast<double>(values.size()));
-  return output;
+class IcacheState : public ProgressState {
+ public:
+  explicit IcacheState(uint16_t slots) : slots_(slots) {}
+  void process(const AccessResult& access) {
+    retire();
+    if (!access.l1_miss) return;
+    const auto existing = in_flight_.find(access.line);
+    if (existing != in_flight_.end()) { progress_ = std::max(progress_, existing->second); return; }
+    while (in_flight_.size() >= slots_) {
+      const auto earliest = std::min_element(in_flight_.begin(), in_flight_.end(),
+          [](const auto& left, const auto& right) { return left.second < right.second; });
+      request_clock_ = std::max(request_clock_, earliest->second);
+      in_flight_.erase(earliest);
+      retire();
+    }
+    const uint64_t done = request_clock_ + access.latency;
+    in_flight_[access.line] = done;
+    progress_ = std::max(progress_, done);
+  }
+ private:
+  void retire() {
+    for (auto it = in_flight_.begin(); it != in_flight_.end();) {
+      if (it->second <= request_clock_) it = in_flight_.erase(it); else ++it;
+    }
+  }
+  uint16_t slots_;
+  uint64_t request_clock_ = 0;
+  std::unordered_map<uint64_t, uint64_t> in_flight_;
+};
+
+class WidthState : public ProgressState {
+ public:
+  explicit WidthState(uint16_t width) : width_(width) {}
+  void add(uint64_t micro_ops) { total_ += micro_ops; progress_ = (total_ + width_ - 1) / width_; }
+ private:
+  uint16_t width_; uint64_t total_ = 0;
+};
+
+class LoadMissPressureState {
+ public:
+  explicit LoadMissPressureState(bool l2) : l2_(l2) {}
+  void observe(const AccessResult& access) { misses_ += l2_ ? access.l2_miss : access.l1_miss; }
+  void finish_macro() { ++macros_; }
+  double readout() {
+    const double value = macros_ == 0 ? 0.0 : 1000.0 * static_cast<double>(misses_) / macros_;
+    misses_ = 0;
+    macros_ = 0;
+    return value;
+  }
+ private:
+  bool l2_;
+  uint64_t misses_ = 0;
+  uint64_t macros_ = 0;
+};
+
+double count_bound(size_t macros, uint64_t count, uint16_t width) {
+  if (count == 0) return static_cast<double>(macros);
+  return static_cast<double>(macros) / std::max(1.0, static_cast<double>(count) / width);
 }
 
-void validate_binding_params(const MechanismBinding& binding,
-                             const ConfigValues& config) {
-  (void)model_spec(binding);
-  for (const auto& param : binding.params) {
-    (void)require_u16(config, param);
-  }
+double port_bound(size_t macros, const WindowCounts& counts, uint16_t rdwr, uint16_t read, bool lower) {
+  if (counts.load == 0 && counts.store == 0) return static_cast<double>(macros);
+  const double store_cycles = static_cast<double>(counts.store) / rdwr;
+  const double cycles = lower
+      ? static_cast<double>(counts.load) / (rdwr + read) + store_cycles
+      : store_cycles + std::max(0.0, static_cast<double>(counts.load) - store_cycles * read) / (rdwr + read);
+  return static_cast<double>(macros) / std::max(1.0, cycles);
 }
+
+enum class Model { ROB, LQ, SQ, ISSUE, PORT_LOWER, PORT_UPPER, WIDTH, ICACHE, L1D_MISS, L2_MISS };
+struct Binding { Model model; std::string parameter; std::string second_parameter; };
+
+Binding parse_binding(const MechanismBinding& binding) {
+  if (binding.model == "rob_capacity_latency_bound") return {Model::ROB, binding.params.at(0), {}};
+  if (binding.model == "load_queue_capacity_latency_bound") return {Model::LQ, binding.params.at(0), {}};
+  if (binding.model == "store_queue_capacity_latency_bound") return {Model::SQ, binding.params.at(0), {}};
+  if (binding.model == "issue_width_count_bound") return {Model::ISSUE, binding.params.at(0), {}};
+  if (binding.model == "load_store_port_lower_bound") return {Model::PORT_LOWER, binding.params.at(0), binding.params.at(1)};
+  if (binding.model == "load_store_port_upper_bound") return {Model::PORT_UPPER, binding.params.at(0), binding.params.at(1)};
+  if (binding.model == "micro_op_width_bound") return {Model::WIDTH, binding.params.at(0), {}};
+  if (binding.model == "icache_fill_slots_bound") return {Model::ICACHE, binding.params.at(0), {}};
+  if (binding.model == "l1d_load_miss_pressure") return {Model::L1D_MISS, {}, {}};
+  if (binding.model == "l2_load_miss_pressure") return {Model::L2_MISS, {}, {}};
+  throw std::runtime_error("unknown Anamol mechanism model: " + binding.model);
+}
+
+class ConfigAnalyzer {
+ public:
+  ConfigAnalyzer(const ConfigValues& config, const std::vector<MechanismBinding>& mechanisms)
+      : config_(config), caches_(config), rob_(require_u16(config, parameter(mechanisms, Model::ROB))),
+        lq_(require_u16(config, parameter(mechanisms, Model::LQ))),
+        sq_(require_u16(config, parameter(mechanisms, Model::SQ))),
+        icache_(require_u16(config, parameter(mechanisms, Model::ICACHE))),
+        l1d_miss_(false), l2_miss_(true),
+        decode_(require_u16(config, parameter(mechanisms, Model::WIDTH, "decode_width"))),
+        rename_(require_u16(config, parameter(mechanisms, Model::WIDTH, "rename_width"))),
+        commit_(require_u16(config, parameter(mechanisms, Model::WIDTH, "commit_width"))) {}
+  void process(const Instr& macro) {
+    icache_.process(caches_.instruction(macro.IP));
+    for (const auto& op : macro.micro_ops) {
+      std::vector<std::pair<uint64_t, uint64_t>> lines;
+      uint64_t memory_latency = 0;
+      const auto access = [&](const MemoryAccess& memory, bool load_read) {
+        if (memory.size == 0) return;
+        const uint64_t first = memory.address / caches_.line_bytes();
+        const uint64_t last = (memory.address + memory.size - 1) / caches_.line_bytes();
+        for (uint64_t line = first; line <= last; ++line) {
+          const auto result = caches_.data(line * caches_.line_bytes());
+          lines.push_back({result.line, result.latency});
+          memory_latency = std::max(memory_latency, result.latency);
+          if (load_read) {
+            l1d_miss_.observe(result);
+            l2_miss_.observe(result);
+          }
+        }
+      };
+      for (const auto& memory : op.reads) access(memory, op.is_load());
+      for (const auto& memory : op.writes) access(memory, false);
+      const uint64_t latency = op.exe_latency + memory_latency;
+      rob_.process(op, latency, lines, true);
+      if (op.is_load()) lq_.process(op, latency, lines, false);
+      if (op.is_store()) sq_.process(op, latency, lines, false);
+      counts_.int_alu += op.is_alu(); counts_.int_mult_div += op.is_alu_mult_div();
+      counts_.fp += op.is_fp(); counts_.fp_mult_div += op.is_fp_mult_div();
+      counts_.load += op.is_load(); counts_.store += op.is_store(); ++counts_.micro_ops;
+    }
+    l1d_miss_.finish_macro();
+    l2_miss_.finish_macro();
+    decode_.add(macro.micro_ops.size()); rename_.add(macro.micro_ops.size()); commit_.add(macro.micro_ops.size());
+    ++macros_;
+  }
+  std::vector<double> snapshot(const std::vector<MechanismBinding>& mechanisms) {
+    std::vector<double> values;
+    values.reserve(mechanisms.size());
+    for (const auto& mechanism : mechanisms) {
+      const Binding binding = parse_binding(mechanism);
+      const uint16_t width = binding.parameter.empty() ? 0 : require_u16(config_, binding.parameter);
+      switch (binding.model) {
+        case Model::ROB: values.push_back(rob_.readout(macros_)); break;
+        case Model::LQ: values.push_back(lq_.readout(macros_)); break;
+        case Model::SQ: values.push_back(sq_.readout(macros_)); break;
+        case Model::ICACHE: values.push_back(icache_.readout(macros_)); break;
+        case Model::L1D_MISS: values.push_back(l1d_miss_.readout()); break;
+        case Model::L2_MISS: values.push_back(l2_miss_.readout()); break;
+        case Model::WIDTH:
+          if (binding.parameter == "decode_width") values.push_back(decode_.readout(macros_));
+          else if (binding.parameter == "rename_width") values.push_back(rename_.readout(macros_));
+          else values.push_back(commit_.readout(macros_));
+          break;
+        case Model::ISSUE:
+          values.push_back(binding.parameter == "int_reg_issue_width" ? count_bound(macros_, counts_.int_alu, width) :
+              binding.parameter == "int_mult_div_issue_width" ? count_bound(macros_, counts_.int_mult_div, width) :
+              binding.parameter == "fp_reg_issue_width" ? count_bound(macros_, counts_.fp, width) :
+              count_bound(macros_, counts_.fp_mult_div, width));
+          break;
+        case Model::PORT_LOWER: values.push_back(port_bound(macros_, counts_, width, require_u16(config_, binding.second_parameter), true)); break;
+        case Model::PORT_UPPER: values.push_back(port_bound(macros_, counts_, width, require_u16(config_, binding.second_parameter), false)); break;
+      }
+    }
+    macros_ = 0; counts_ = {};
+    return values;
+  }
+ private:
+  static std::string parameter(const std::vector<MechanismBinding>& mechanisms, Model wanted, const std::string& fallback = {}) {
+    for (const auto& mechanism : mechanisms) {
+      const Binding binding = parse_binding(mechanism);
+      if (binding.model == wanted && (fallback.empty() || binding.parameter == fallback)) return binding.parameter;
+    }
+    throw std::runtime_error("Anamol canonical mechanism is missing");
+  }
+  const ConfigValues& config_; CacheHierarchy caches_; QueueState rob_, lq_, sq_; IcacheState icache_; LoadMissPressureState l1d_miss_, l2_miss_; WidthState decode_, rename_, commit_; WindowCounts counts_; size_t macros_ = 0;
+};
 
 }  // namespace
 
-size_t feature_count(const std::vector<MechanismBinding>& mechanisms) {
-  return mechanisms.size() * kFeaturesPerDistribution;
-}
+size_t feature_count(const std::vector<MechanismBinding>& mechanisms) { return mechanisms.size() * kFeaturesPerDistribution; }
 
-std::vector<double> analyze_trace(
-    const std::vector<Instr>& instrs,
-    int window_size,
-    const std::vector<ConfigValues>& configs,
-    const std::vector<MechanismBinding>& mechanisms) {
-  if (instrs.empty())
-    throw std::runtime_error("Anamol trace contains no instructions");
-  if (window_size <= 0)
-    throw std::runtime_error("Anamol window size must be positive");
-  if (configs.empty())
-    throw std::runtime_error("Anamol configs must not be empty");
-  if (mechanisms.empty())
-    throw std::runtime_error("Anamol mechanisms must not be empty");
-
-  bool annotate = false;
-  for (const auto& binding : mechanisms) {
-    annotate = annotate || model_spec(binding).requires_cache_annotation;
-  }
-  const PreparedTrace prepared = prepare_trace(instrs, window_size);
-  std::vector<double> matrix;
-  matrix.reserve(configs.size() * feature_count(mechanisms));
-
-  for (const auto& config : configs) {
-    LatencyOverlay overlay;
-    const LatencyOverlay* active_overlay = nullptr;
-    if (annotate) {
-      overlay = annotate_cache_latencies(instrs, config);
-      active_overlay = &overlay;
-    }
-    const ActiveTrace active_trace{instrs, active_overlay};
-    for (size_t mechanism_index = 0; mechanism_index < mechanisms.size();
-         ++mechanism_index) {
-      validate_binding_params(mechanisms[mechanism_index], config);
-      auto features = distribution_features(component_samples(
-          prepared, active_trace, mechanisms[mechanism_index], config));
-      matrix.insert(matrix.end(), features.begin(), features.end());
-    }
-  }
-  return matrix;
-}
-
-std::vector<double> analyze_trace_windows(
-    const std::vector<Instr>& instrs,
-    int full_roi_window_size,
-    int analysis_window_size,
-    size_t requested_window_count,
-    const std::vector<ConfigValues>& configs,
-    const std::vector<MechanismBinding>& mechanisms) {
-  if (instrs.empty())
-    throw std::runtime_error("Anamol trace contains no instructions");
-  if (full_roi_window_size <= 0)
-    throw std::runtime_error("Anamol full-ROI window size must be positive");
-  if (analysis_window_size <= 0)
-    throw std::runtime_error("Anamol analysis window size must be positive");
-  if (configs.empty())
-    throw std::runtime_error("Anamol configs must not be empty");
-  if (mechanisms.empty())
-    throw std::runtime_error("Anamol mechanisms must not be empty");
-
-  bool annotate = false;
-  for (const auto& binding : mechanisms) {
-    annotate = annotate || model_spec(binding).requires_cache_annotation;
-  }
+std::vector<double> analyze_trace_windows(const std::vector<Instr>& instrs, int full_roi_window_size,
+                                          int analysis_window_size, size_t requested_window_count,
+                                          const std::vector<ConfigValues>& configs,
+                                          const std::vector<MechanismBinding>& mechanisms) {
+  if (full_roi_window_size <= 0 || analysis_window_size <= 0 || configs.empty() || mechanisms.empty())
+    throw std::runtime_error("invalid Anamol full-ROI analysis arguments");
+  const size_t full = static_cast<size_t>(full_roi_window_size), analysis = static_cast<size_t>(analysis_window_size);
+  if (full % analysis != 0 || requested_window_count < 2 || requested_window_count > instrs.size() / full)
+    throw std::runtime_error("Anamol requires at least two complete, evenly divisible full-ROI windows");
   const size_t feature_columns = feature_count(mechanisms);
-  const size_t full_step = static_cast<size_t>(full_roi_window_size);
-  const size_t available_window_count = instrs.size() / full_step;
-  const size_t window_count = requested_window_count;
-  if (window_count == 0)
-    throw std::runtime_error("Anamol trace has no complete full-ROI windows");
-  if (window_count > available_window_count)
-    throw std::runtime_error("Anamol requested more full-ROI windows than the trace contains");
-
-  std::vector<double> matrix;
-  matrix.resize(window_count * configs.size() * feature_columns);
-  std::vector<PreparedTrace> prepared_windows;
-  prepared_windows.reserve(window_count);
-  for (size_t full_window = 0; full_window < window_count; ++full_window) {
-    const size_t start = full_window * full_step;
-    prepared_windows.push_back(
-        prepare_trace_range(instrs, start, start + full_step, analysis_window_size));
-  }
-
-  #pragma omp parallel for schedule(dynamic)
+  std::vector<double> output(configs.size() * (requested_window_count - 1) * feature_columns);
   for (size_t config_index = 0; config_index < configs.size(); ++config_index) {
-    const auto& config = configs[config_index];
-    const size_t config_offset = config_index * window_count * feature_columns;
-    const LatencyOverlay* active_overlay = nullptr;
-    LatencyOverlay overlay;
-    if (annotate) {
-      overlay = annotate_cache_latencies(instrs, config);
-      active_overlay = &overlay;
-    }
-    const ActiveTrace active_trace{instrs, active_overlay};
-    size_t write_offset = config_offset;
-    for (size_t full_window = 0; full_window < window_count; ++full_window) {
-      const PreparedTrace& prepared = prepared_windows[full_window];
-      for (size_t mechanism_index = 0; mechanism_index < mechanisms.size();
-           ++mechanism_index) {
-        validate_binding_params(mechanisms[mechanism_index], config);
-        auto features = distribution_features(component_samples(
-            prepared, active_trace, mechanisms[mechanism_index], config));
-        std::copy(features.begin(), features.end(), matrix.begin() + write_offset);
-        write_offset += features.size();
+    ConfigAnalyzer analyzer(configs[config_index], mechanisms);
+    std::vector<std::vector<double>> samples(mechanisms.size());
+    size_t write_window = 0;
+    for (size_t index = 0; index < requested_window_count * full; ++index) {
+      analyzer.process(instrs[index]);
+      if ((index + 1) % analysis == 0) {
+        const auto snapshot = analyzer.snapshot(mechanisms);
+        for (size_t mechanism = 0; mechanism < mechanisms.size(); ++mechanism) samples[mechanism].push_back(snapshot[mechanism]);
+      }
+      if ((index + 1) % full == 0) {
+        const size_t raw_window = (index + 1) / full - 1;
+        if (raw_window != 0) {
+          size_t offset = (config_index * (requested_window_count - 1) + write_window++) * feature_columns;
+          for (auto& component : samples) {
+            const auto features = distribution_features(std::move(component));
+            std::copy(features.begin(), features.end(), output.begin() + offset);
+            offset += features.size();
+          }
+        }
+        samples.assign(mechanisms.size(), {});
       }
     }
   }
-  return matrix;
+  return output;
 }
 
 }  // namespace analytical

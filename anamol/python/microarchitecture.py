@@ -19,9 +19,18 @@ SUPPORTED_COMPONENT_MODELS = frozenset(
         "load_queue_capacity_latency_bound",
         "store_queue_capacity_latency_bound",
         "issue_width_count_bound",
-        "load_store_port_combined_bound",
-        "width_bound",
+        "load_store_port_lower_bound",
+        "load_store_port_upper_bound",
+        "micro_op_width_bound",
         "icache_fill_slots_bound",
+        "l1d_load_miss_pressure",
+        "l2_load_miss_pressure",
+    )
+)
+PARAMETERLESS_COMPONENT_MODELS = frozenset(
+    (
+        "l1d_load_miss_pressure",
+        "l2_load_miss_pressure",
     )
 )
 ANALYSIS_CACHE_INPUTS = frozenset(
@@ -44,6 +53,8 @@ CACHE_ANNOTATED_MODELS = frozenset(
         "load_queue_capacity_latency_bound",
         "store_queue_capacity_latency_bound",
         "icache_fill_slots_bound",
+        "l1d_load_miss_pressure",
+        "l2_load_miss_pressure",
     )
 )
 
@@ -334,8 +345,8 @@ def _analysis_model(raw: Any) -> AnalysisModel:
         if model not in SUPPORTED_COMPONENT_MODELS:
             raise ValueError(f"unknown analysis component model: {name}={model}")
         params = node.get("params")
-        if not isinstance(params, list) or not params:
-            raise ValueError(f"analysis component params must be a non-empty list: {name}")
+        if not isinstance(params, list) or (not params and model not in PARAMETERLESS_COMPONENT_MODELS):
+            raise ValueError(f"analysis component params are invalid: {name}")
         components.append(ComponentDef(name=name, model=model, params=tuple(str(item) for item in params)))
     return AnalysisModel(inputs, tuple(components))
 

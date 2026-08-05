@@ -76,26 +76,6 @@ PYBIND11_MODULE(_analysis, module) {
   });
 
   module.def(
-      "analyze_trace",
-      [](const std::string& trace_path, int window_size, const py::list& configs,
-         const py::list& mechanisms) {
-        auto rows = parse_configs(configs);
-        auto bindings = parse_mechanisms(mechanisms);
-        std::vector<analytical::Instr> parsed;
-        std::vector<double> flat;
-        {
-          py::gil_scoped_release release;
-          parsed = parse_single_region(trace_path);
-          flat = analytical::analyze_trace(parsed, window_size, rows, bindings);
-        }
-        const size_t row_count = rows.size();
-        const size_t column_count = analytical::feature_count(bindings);
-        py::array_t<double> output({row_count, column_count});
-        std::copy(flat.begin(), flat.end(), output.mutable_data());
-        return output;
-      });
-
-  module.def(
       "analyze_trace_windows",
       [](const std::string& trace_path, int full_roi_window_size,
          int analysis_window_size, size_t window_count, const py::list& configs,

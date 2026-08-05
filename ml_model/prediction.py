@@ -23,9 +23,6 @@ from .multitask import predict_multihead
 from .multitask import regression_error_report
 
 
-VALIDATION_FRACTION = 0.15
-
-
 @dataclass(frozen=True)
 class FeatureSet:
     feature_set_id: str
@@ -123,9 +120,9 @@ def evaluate_prediction_task(
     values = frame[task.group_column].astype(str).to_numpy()
     groups = tuple(sorted(set(values)))
     evaluation_groups = groups
-    fold_count = task.evaluation_folds if task.group_column == "config_id" else len(groups)
-    if len(evaluation_groups) < fold_count:
-        raise ValueError("grouped evaluation has fewer groups than folds")
+    fold_count = min(task.evaluation_folds, len(evaluation_groups))
+    if fold_count < 3:
+        raise ValueError("grouped evaluation requires at least three groups")
     truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
     features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
     prediction = np.empty_like(truth)
@@ -181,7 +178,7 @@ def evaluate_prediction_task(
         primary_metric = _primary_metric("macro_workload")
     report = {
         "task_id": task.task_id,
-        "protocol": "grouped_config_kfold" if task.group_column == "config_id" else "leave_one_workload_out",
+        "protocol": "grouped_config_kfold" if task.group_column == "config_id" else "grouped_workload_kfold",
         "generalization_scope": "held_out_configuration" if task.group_column == "config_id" else "joint_program_microarchitecture_ood",
         "primary_metric": primary_metric,
         "samples": int(evaluated.sum()), "groups": len(evaluation_groups),
@@ -210,48 +207,82 @@ def evaluate_prediction_task(
     }
 
 
-def evaluate_random_roi_split_prediction_task(
+def evaluate_family_variant_prediction_task(
     *, task: PredictionTask, dataset_dir: str | Path, output_dir: str | Path,
-    workload_ids: tuple[str, ...] | None = None,
+    workload_families: Mapping[str, tuple[str, str]], workload_ids: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    """Evaluate the fixed model with the historical random 70/15/15 ROI split."""
+    """Hold out one workload variant while retaining a sibling in training."""
     frame = _read_task_frame(task, dataset_dir, workload_ids)
-    train, valid, test = _random_roi_masks(len(frame), task.seed)
+    workloads = tuple(sorted(set(frame["workload_id"].astype(str))))
+    missing = set(workloads) - set(workload_families)
+    if missing:
+        raise ValueError(f"family-variant evaluation lacks workload identities: {sorted(missing)}")
+    families: dict[str, list[tuple[str, str]]] = {}
+    for workload in workloads:
+        family, variant = workload_families[workload]
+        families.setdefault(family, []).append((variant, workload))
+    for family, variants in families.items():
+        if len(variants) < 3 or len({variant for variant, _ in variants}) != len(variants):
+            raise ValueError(f"family-variant evaluation requires three distinct variants: {family}")
+    values = frame["workload_id"].astype(str).to_numpy()
     truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
     features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
-    prediction = np.empty((int(test.sum()), len(task.output_metrics)), dtype=np.float32)
-    epochs: dict[str, int] = {}
-    for index, metric in enumerate(task.output_metrics):
-        fitted = fit_multihead(
-            training=task.training, train_x=features[train], train_y=truth[train, index:index + 1],
-            validation_x=features[valid], validation_y=truth[valid, index:index + 1],
-            seed=task.seed + index, label_columns=(task.label_columns[index],),
-        )
-        prediction[:, index] = predict_multihead(fitted, features[test])[:, 0]
-        epochs[metric] = fitted.epochs
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    predictions_path = output / "test_predictions.parquet"
-    _write_predictions(frame.loc[test], task, truth[test], prediction, predictions_path)
-    report = {
-        "task_id": task.task_id,
-        "protocol": "random_roi_split",
-        "generalization_scope": "in_distribution_random_roi",
-        "primary_metric": _primary_metric("roi_weighted"),
-        "samples": len(frame),
-        "split": {
-            "seed": task.seed, "train_fraction": 0.70, "validation_fraction": 0.15,
-            "test_fraction": 0.15, "train_rows": int(train.sum()),
-            "validation_rows": int(valid.sum()), "test_rows": int(test.sum()), "epochs": epochs,
-        },
-        "metrics": {
-            "roi_weighted": regression_error_report(task.label_columns, truth[test], prediction),
-        },
-        "test_predictions": str(predictions_path),
+    prediction = np.empty_like(truth)
+    evaluated = np.zeros(len(frame), dtype=bool)
+    folds: list[dict[str, object]] = []
+    for family in sorted(families):
+        variants = sorted(families[family])
+        for index, (_, heldout_workload) in enumerate(variants):
+            validation_workload = variants[(index + 1) % len(variants)][1]
+            test = values == heldout_workload
+            valid = values == validation_workload
+            train = ~(test | valid)
+            fitted = fit_multihead(
+                training=task.training, train_x=features[train], train_y=truth[train],
+                validation_x=features[valid], validation_y=truth[valid],
+                seed=task.seed + len(folds), label_columns=task.label_columns,
+            )
+            prediction[test] = predict_multihead(fitted, features[test])
+            evaluated |= test
+            folds.append({
+                "family": family, "heldout_workload": heldout_workload,
+                "validation_workload": validation_workload,
+                "train_workloads": sorted(set(values[train])), "train_rows": int(train.sum()),
+                "validation_rows": int(valid.sum()), "test_rows": int(test.sum()), "epochs": fitted.epochs,
+            })
+    destination = Path(output_dir)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output = destination.with_name(f".{destination.name}.partial")
+    shutil.rmtree(output, ignore_errors=True)
+    output.mkdir()
+    oof_path = output / "oof_predictions.parquet"
+    _write_predictions(frame.loc[evaluated], task, truth[evaluated], prediction[evaluated], oof_path)
+    metric_report = {
+        "roi_weighted": regression_error_report(task.label_columns, truth[evaluated], prediction[evaluated]),
+        "macro_workload": _macro_workload_report(task, values[evaluated], truth[evaluated], prediction[evaluated]),
+        "per_workload": _per_workload_report(task, values[evaluated], truth[evaluated], prediction[evaluated]),
     }
     evaluation = output / "evaluation.json"
-    evaluation.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {"evaluation": str(evaluation), "test_predictions": str(predictions_path)}
+    evaluation.write_text(json.dumps({
+        "task_id": task.task_id, "protocol": "leave_one_family_variant_out",
+        "generalization_scope": "unseen_workload_variant_with_seen_family", "primary_metric": _primary_metric("macro_workload"),
+        "samples": int(evaluated.sum()), "workloads": len(workloads), "families": len(families),
+        "data_limitations": task.data_limitations, "metrics": metric_report, "outer_folds": folds,
+        "oof_predictions": str(destination / oof_path.name),
+    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    previous = destination.with_name(f".{destination.name}.previous")
+    if previous.exists():
+        raise RuntimeError(f"previous evaluation directory exists: {previous}")
+    if destination.exists():
+        destination.replace(previous)
+    try:
+        output.replace(destination)
+    except BaseException:
+        if previous.exists():
+            previous.replace(destination)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
+    return {"evaluation": str(destination / evaluation.name), "oof_predictions": str(destination / oof_path.name)}
 
 
 def _read_task_frame(task, dataset_dir, workload_ids):
@@ -298,23 +329,6 @@ def _delta_report(task, truth_parts, prediction_parts):
             (task.label_columns[index],), truth[selected, 1:2], prediction[selected, 1:2],
         )[metric]
     return report
-
-
-def _random_roi_masks(rows, seed):
-    if rows < 3:
-        raise ValueError("random ROI split requires at least three rows")
-    order = np.random.default_rng(seed).permutation(rows)
-    validation_rows = max(1, int(round(rows * VALIDATION_FRACTION)))
-    test_rows = max(1, int(round(rows * VALIDATION_FRACTION)))
-    if validation_rows + test_rows >= rows:
-        raise ValueError("random ROI split leaves no training rows")
-    train = np.zeros(rows, dtype=bool)
-    valid = np.zeros(rows, dtype=bool)
-    test = np.zeros(rows, dtype=bool)
-    valid[order[:validation_rows]] = True
-    test[order[validation_rows:validation_rows + test_rows]] = True
-    train[order[validation_rows + test_rows:]] = True
-    return train, valid, test
 
 
 def _per_workload_report(task, values, truth, prediction):

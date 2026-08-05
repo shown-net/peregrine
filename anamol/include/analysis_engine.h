@@ -20,12 +20,6 @@ using ConfigValues = std::map<std::string, double>;
 
 size_t feature_count(const std::vector<MechanismBinding>& mechanisms);
 
-std::vector<double> analyze_trace(
-    const std::vector<Instr>& instrs,
-    int window_size,
-    const std::vector<ConfigValues>& configs,
-    const std::vector<MechanismBinding>& mechanisms);
-
 std::vector<double> analyze_trace_windows(
     const std::vector<Instr>& instrs,
     int full_roi_window_size,

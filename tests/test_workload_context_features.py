@@ -103,10 +103,10 @@ def test_candidate_feature_table_uses_reference_config_for_context(monkeypatch, 
 
     def fake_analyze_full_roi_windows(**kwargs):
         configs = kwargs["configs"]
-        values = np.zeros((2, len(configs), len(analytical)), dtype=np.float64)
-        values[:, 0, 0] = [1.0, 3.0]
-        values[:, 1, 0] = [100.0, 200.0]
-        values[:, 0, analytical.index("dynamic_rob_mean")] = [1.0, 3.0]
+        values = np.zeros((1, len(configs), len(analytical)), dtype=np.float64)
+        values[:, 0, 0] = [3.0]
+        values[:, 1, 0] = [200.0]
+        values[:, 0, analytical.index("dynamic_rob_mean")] = [3.0]
         return values
 
     monkeypatch.setattr(
@@ -124,6 +124,7 @@ def test_candidate_feature_table_uses_reference_config_for_context(monkeypatch, 
     )
 
     context_columns = workload_context_feature_columns(config.microarchitecture.mechanisms)
-    assert table.column(analytical[0]).to_pylist() == [100.0, 200.0]
-    assert table.column(context_columns[0]).to_pylist() == [2.0, 2.0]
-    assert table.column(context_columns[1]).to_pylist() == [2.8, 2.8]
+    assert table.column("window_index").to_pylist() == [1]
+    assert table.column(analytical[0]).to_pylist() == [200.0]
+    assert table.column(context_columns[0]).to_pylist() == [3.0]
+    assert table.column(context_columns[1]).to_pylist() == [3.0]

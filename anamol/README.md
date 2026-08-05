@@ -8,11 +8,9 @@ training or sweep pipeline in this repository.
 ## Active Role
 
 - `anamol/python/feature_pipeline.py` calls the compiled `_analysis` extension
-  to turn CPU-owned Peregrine traces into analytical feature batches.
-- `anamol/python/dataset.py` combines those feature batches with CPU-owned
-  gem5 statistics to build L1 surrogate datasets.
-- `registry.yaml` and the generated headers define the analytical resources
-  compiled into the extension.
+  to turn one CPU-owned full-ROI trace into causally continuous feature windows.
+- `anamol/python/dataset.py` aligns those windows with CPU-owned gem5 statistics
+  after the shared warm-up interval.
 
 ## Build
 
@@ -27,12 +25,8 @@ must remain untracked.
 
 ## Maintained Files
 
-- `registry.yaml`: source for analytical resources and generated bindings.
-- `src/` and `include/`: C++ parser, analytical models, and extension code.
+- `src/` and `include/`: C++ parser, causal component states, and extension code.
 - `python/feature_pipeline.py`: active Python entrypoint used by L1 dataset
   construction.
-- `python/gen_registry.py`: generator used by the Makefile when
-  `registry.yaml` changes.
-
-Historical lookup-table, sweep-to-training, and standalone training scripts
-were removed when the parent repository became the canonical workflow owner.
+Historical random-region, registry-generated, and standalone analysis paths
+were removed; the full-ROI extension is the only analytical entrypoint.

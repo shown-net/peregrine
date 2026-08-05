@@ -130,6 +130,23 @@ void validate_offsets(const google::protobuf::RepeatedField<uint32_t>& offsets,
       throw std::runtime_error("nonmonotonic dependency offsets");
 }
 
+void validate_micro_ops(const ProtoMessage::AnamolTraceChunk& chunk, int records) {
+  const int micro_ops = chunk.micro_op_ids_size();
+  if (micro_ops <= 0 || chunk.micro_op_offsets_size() != records + 1 ||
+      chunk.micro_op_class_flags_size() != micro_ops ||
+      chunk.micro_op_fixed_execution_latencies_size() != micro_ops ||
+      chunk.micro_op_read_sizes_size() != chunk.micro_op_read_addresses_size() ||
+      chunk.micro_op_write_sizes_size() != chunk.micro_op_write_addresses_size())
+    throw std::runtime_error("invalid Anamol micro-op trace chunk lengths");
+  validate_offsets(chunk.micro_op_offsets(), records, micro_ops);
+  validate_offsets(chunk.micro_op_dep_offsets(), micro_ops,
+                   chunk.micro_op_dep_ids_size());
+  validate_offsets(chunk.micro_op_read_offsets(), micro_ops,
+                   chunk.micro_op_read_addresses_size());
+  validate_offsets(chunk.micro_op_write_offsets(), micro_ops,
+                   chunk.micro_op_write_addresses_size());
+}
+
 }  // namespace
 
 void stream_proto_region(
@@ -138,6 +155,8 @@ void stream_proto_region(
   ZstdFrameReader reader(proto_path);
 
   std::vector<Instr> section;
+  instr_id_t previous_micro_id = 0;
+  bool have_micro_id = false;
   ProtoMessage::AnamolTraceChunk chunk;
   while (reader.readDelimited(chunk)) {
     const int records = chunk.ids_size();
@@ -154,6 +173,7 @@ void stream_proto_region(
     validate_offsets(chunk.dep_offsets(), records, chunk.dep_ids_size());
     validate_offsets(chunk.read_offsets(), records, chunk.read_addresses_size());
     validate_offsets(chunk.write_offsets(), records, chunk.write_addresses_size());
+    validate_micro_ops(chunk, records);
 
     for (int index = 0; index < records; ++index) {
       Instr instr{};
@@ -190,6 +210,36 @@ void stream_proto_region(
         if (instr.write_address == 0)
           instr.write_address = chunk.write_addresses(int(flat));
       }
+      for (uint32_t micro = chunk.micro_op_offsets(index);
+           micro < chunk.micro_op_offsets(index + 1); ++micro) {
+        MicroOp op{};
+        op.id = chunk.micro_op_ids(int(micro));
+        if (have_micro_id && op.id <= previous_micro_id)
+          throw std::runtime_error("Anamol micro-op IDs must be globally increasing");
+        op.class_flags = chunk.micro_op_class_flags(int(micro));
+        const uint32_t latency = chunk.micro_op_fixed_execution_latencies(int(micro));
+        if (latency > UINT16_MAX)
+          throw std::runtime_error("Anamol micro-op latency exceeds supported range");
+        op.exe_latency = static_cast<latency_t>(latency);
+        for (uint32_t flat = chunk.micro_op_dep_offsets(int(micro));
+             flat < chunk.micro_op_dep_offsets(int(micro + 1)); ++flat)
+          op.deps.push_back(chunk.micro_op_dep_ids(int(flat)));
+        for (const instr_id_t dependency : op.deps) {
+          if (dependency >= op.id)
+            throw std::runtime_error("Anamol micro-op dependency must be causal");
+        }
+        for (uint32_t flat = chunk.micro_op_read_offsets(int(micro));
+             flat < chunk.micro_op_read_offsets(int(micro + 1)); ++flat)
+          op.reads.push_back({chunk.micro_op_read_addresses(int(flat)),
+                              chunk.micro_op_read_sizes(int(flat))});
+        for (uint32_t flat = chunk.micro_op_write_offsets(int(micro));
+             flat < chunk.micro_op_write_offsets(int(micro + 1)); ++flat)
+          op.writes.push_back({chunk.micro_op_write_addresses(int(flat)),
+                               chunk.micro_op_write_sizes(int(flat))});
+        instr.micro_ops.push_back(std::move(op));
+        previous_micro_id = chunk.micro_op_ids(int(micro));
+        have_micro_id = true;
+      }
       section.push_back(std::move(instr));
     }
     chunk.Clear();
@@ -200,4 +250,3 @@ void stream_proto_region(
 }
 
 }  // namespace analytical
-

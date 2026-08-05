@@ -35,31 +35,17 @@ PROTO_OBJ := $(OBJDIR)/proto/peregrine_trace.pb.o
 PROTO_PYEXT_OBJ := $(OBJDIR)/pyext_proto/peregrine_trace.pb.o
 ANAMOL_ROOT_PYEXT := _analysis$(PY_EXT_SUFFIX)
 
-SRCS_MAIN := \
-  $(SRC_DIR)/main.cpp \
-  $(SRC_DIR)/analysis_engine.cpp \
-  $(SRCS_PARSER) \
-  $(SRC_DIR)/models.cpp
-
 SRCS_PYEXT := \
   $(SRC_DIR)/python_extension.cpp \
   $(SRC_DIR)/analysis_engine.cpp \
-  $(SRCS_PARSER) \
-  $(SRC_DIR)/models.cpp
+  $(SRCS_PARSER)
 
 # ---- Objects ----
-OBJS_MAIN := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/%.o,$(filter $(SRC_DIR)/%,$(SRCS_MAIN))) \
-             $(PROTO_OBJ)
-
 OBJS_PYEXT := $(patsubst $(SRC_DIR)/%.cpp,$(OBJDIR)/pyext_%.o,$(filter $(SRC_DIR)/%,$(SRCS_PYEXT))) \
               $(PROTO_PYEXT_OBJ)
 
 # ---- Default ----
-all: $(BUILD)/main $(ANAMOL_ROOT_PYEXT)
-
-# Add a named target for the main executable
-anamol: $(BUILD)/main
-	@cp $(BUILD)/main anamol || true
+all: $(ANAMOL_ROOT_PYEXT)
 
 python-extension: $(ANAMOL_ROOT_PYEXT)
 
@@ -88,10 +74,6 @@ $(OBJDIR)/pyext_%.o: $(SRC_DIR)/%.cpp $(PROTO_SRC) | prep
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -fPIC $(INCLUDE) $(PYBIND11_INCLUDES) $(OMP_FLAG) -c $< -o $@
 
-# ---- Link executables ----
-$(BUILD)/main: $(OBJS_MAIN)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) $(OMP_FLAG) $^ $(LDLIBS) -o $@
-
 $(ANAMOL_ROOT_PYEXT): $(OBJS_PYEXT)
 	$(CXX) $(CXXFLAGS) -shared $(OMP_FLAG) $^ $(LDLIBS) -o $@
 
@@ -102,4 +84,4 @@ clean:
 clean-gen:
 	rm -f include/resources_gen.h include/params_gen.h include/resource_registry.h include/models_decl_gen.h python/config_gen.py
 
-.PHONY: all clean clean-gen prep anamol python-extension
+.PHONY: all clean clean-gen prep python-extension
