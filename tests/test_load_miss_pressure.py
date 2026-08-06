@@ -91,3 +91,22 @@ def test_load_miss_pressure_keeps_cache_state_across_warmup(tmp_path: Path) -> N
     assert features.shape == (1, 1, len(columns))
     assert np.isclose(features[0, 0, columns.index("dynamic_l1d_load_miss_pressure_mean")], 500.0)
     assert np.isclose(features[0, 0, columns.index("dynamic_l2_load_miss_pressure_mean")], 500.0)
+
+
+def test_config_parallelism_preserves_feature_order_and_values(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    config = load_peregrine_config(
+        root / "peregrine/configs/peregrine.yaml",
+        metrics_config=root / "configs/metrics.yaml",
+        microarchitecture=load_microarchitecture_config(root / "configs/microarchitectures/zte_neoverse_n2.yaml"),
+    )
+    values = dict(config.microarchitecture.analytical_values(config.microarchitecture.parameter_values()))
+    common = {
+        "trace_path": _write_trace(tmp_path), "configs": (values, values),
+        "full_roi_window_size": 2, "analysis_window_size": 1, "window_count": 2,
+        "mechanisms": config.microarchitecture.mechanisms,
+    }
+    serial = analyze_full_roi_windows(**common, config_threads=1)
+    parallel = analyze_full_roi_windows(**common, config_threads=2)
+    assert serial.shape == parallel.shape
+    assert np.allclose(serial, parallel)

@@ -79,7 +79,7 @@ PYBIND11_MODULE(_analysis, module) {
       "analyze_trace_windows",
       [](const std::string& trace_path, int full_roi_window_size,
          int analysis_window_size, size_t window_count, const py::list& configs,
-         const py::list& mechanisms) {
+         const py::list& mechanisms, int config_threads) {
         auto rows = parse_configs(configs);
         auto bindings = parse_mechanisms(mechanisms);
         std::vector<analytical::Instr> parsed;
@@ -89,7 +89,7 @@ PYBIND11_MODULE(_analysis, module) {
           parsed = parse_single_region(trace_path);
           flat = analytical::analyze_trace_windows(
               parsed, full_roi_window_size, analysis_window_size, window_count, rows,
-              bindings);
+              bindings, config_threads);
         }
         const size_t column_count = analytical::feature_count(bindings);
         const size_t config_count = rows.size();

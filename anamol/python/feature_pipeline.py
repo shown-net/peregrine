@@ -44,6 +44,7 @@ def analyze_full_roi_windows(
     analysis_window_size: int,
     window_count: int,
     mechanisms: tuple[ComponentDef, ...],
+    config_threads: int = 1,
 ) -> np.ndarray:
     if not configs:
         raise ValueError("Anamol configs must not be empty")
@@ -53,6 +54,8 @@ def analyze_full_roi_windows(
         raise ValueError("analysis window size must be positive")
     if window_count < 2:
         raise ValueError("full-ROI analysis needs one warm-up and one labeled window")
+    if config_threads < 1:
+        raise ValueError("Anamol config thread budget must be positive")
     trace = Path(trace_path).resolve()
     if trace.suffixes[-2:] != [".pb", ".zst"]:
         raise ValueError(f"Anamol requires a protobuf trace: {trace}")
@@ -68,6 +71,7 @@ def analyze_full_roi_windows(
         int(window_count),
         [dict(config) for config in configs],
         bindings,
+        int(config_threads),
     )
     values = np.asarray(values, dtype=np.float64)
     if values.ndim != 3 or values.shape[0] != len(configs) or values.shape[2] != expected_columns:

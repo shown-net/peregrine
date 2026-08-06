@@ -111,7 +111,9 @@ def build_full_roi_dataset_shards(
             if stale.name not in expected_shards:
                 stale.unlink()
     reports: list[dict[str, int | str]] = []
-    with ThreadPoolExecutor(max_workers=min(workers, len(canonical_workloads))) as executor:
+    workload_workers = min(workers, len(canonical_workloads))
+    config_threads = max(1, workers // workload_workers)
+    with ThreadPoolExecutor(max_workers=workload_workers) as executor:
         futures = [
             executor.submit(
                 _build_full_roi_workload_artifacts,
@@ -120,6 +122,7 @@ def build_full_roi_dataset_shards(
                 workload_id=workload_id,
                 output_root=out,
                 full_roi_window_size=full_roi_window_size,
+                config_threads=config_threads,
             )
             for workload_id in canonical_workloads
         ]
@@ -445,6 +448,7 @@ def _build_full_roi_workload_dataset(
     workload_id: str,
     destination: Path,
     full_roi_window_size: int,
+    config_threads: int,
 ) -> dict[str, int | str]:
     raw = load_config_stats_workload(config=config, raw_root=raw_root, workload_id=workload_id)
     trace_path = raw.reference_trace_path
@@ -478,6 +482,7 @@ def _build_full_roi_workload_dataset(
         samples=samples,
         destination=destination,
         full_roi_window_size=full_roi_window_size,
+        config_threads=config_threads,
     )
     _validate_full_roi_dataset_shard(
         destination,
@@ -490,13 +495,13 @@ def _build_full_roi_workload_dataset(
 
 def _build_full_roi_workload_artifacts(
     *, config: PeregrineConfig, raw_root: Path, workload_id: str, output_root: Path,
-    full_roi_window_size: int,
+    full_roi_window_size: int, config_threads: int,
 ) -> dict[str, int | str]:
     """Create reusable base/component artifacts from one causal trace scan."""
     aggregate = output_root / "aggregated" / f"{_shard_stem(workload_id)}.parquet"
     report = _build_full_roi_workload_dataset(
         config=config, raw_root=raw_root, workload_id=workload_id, destination=aggregate,
-        full_roi_window_size=full_roi_window_size,
+        full_roi_window_size=full_roi_window_size, config_threads=config_threads,
     )
     source = pq.read_table(aggregate)
     base_columns = _full_roi_base_columns(config)
@@ -641,6 +646,7 @@ def _write_full_roi_workload_dataset(
     samples: tuple[FullRoiConfigSample, ...],
     destination: Path,
     full_roi_window_size: int,
+    config_threads: int,
 ) -> int:
     schema = _full_roi_dataset_schema(config)
     table_context = _dataset_table_context(config)
@@ -652,6 +658,7 @@ def _write_full_roi_workload_dataset(
         analysis_window_size=config.analysis.window_size,
         window_count=samples[0].labels.shape[0],
         mechanisms=config.microarchitecture.mechanisms,
+        config_threads=config_threads,
     )
     workload_context = _workload_context_values(
         features,

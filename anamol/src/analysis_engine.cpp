@@ -1,6 +1,7 @@
 #include "analysis_engine.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <deque>
 #include <limits>
@@ -102,19 +103,18 @@ std::vector<double> distribution_features(std::vector<double> values) {
   out.reserve(kFeaturesPerDistribution);
   for (size_t index = 0; index < 50; ++index)
     out.push_back(percentile((static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0));
-  double weight = 0.0;
-  for (double value : values) weight += std::max(0.0, value);
+  std::vector<double> cumulative(values.size());
+  std::transform(values.begin(), values.end(), cumulative.begin(), [](double value) {
+    return std::max(0.0, value);
+  });
+  std::partial_sum(cumulative.begin(), cumulative.end(), cumulative.begin());
+  const double weight = cumulative.back();
   for (size_t index = 0; index < 50; ++index) {
     const double point = (static_cast<double>(index) * 98.0 / 49.0 + 1.0) / 100.0;
     if (weight == 0.0) { out.push_back(percentile(point)); continue; }
     const double target = point * weight;
-    double cumulative = 0.0;
-    size_t selected = values.size() - 1;
-    for (size_t value = 0; value < values.size(); ++value) {
-      cumulative += std::max(0.0, values[value]);
-      if (cumulative >= target) { selected = value; break; }
-    }
-    out.push_back(values[selected]);
+    const auto selected = std::lower_bound(cumulative.begin(), cumulative.end(), target);
+    out.push_back(values[static_cast<size_t>(selected - cumulative.begin())]);
   }
   out.push_back(std::accumulate(values.begin(), values.end(), 0.0) / values.size());
   return out;
@@ -264,15 +264,15 @@ Binding parse_binding(const MechanismBinding& binding) {
 
 class ConfigAnalyzer {
  public:
-  ConfigAnalyzer(const ConfigValues& config, const std::vector<MechanismBinding>& mechanisms)
-      : config_(config), caches_(config), rob_(require_u16(config, parameter(mechanisms, Model::ROB))),
-        lq_(require_u16(config, parameter(mechanisms, Model::LQ))),
-        sq_(require_u16(config, parameter(mechanisms, Model::SQ))),
-        icache_(require_u16(config, parameter(mechanisms, Model::ICACHE))),
+  ConfigAnalyzer(const ConfigValues& config, const std::vector<Binding>& bindings)
+      : config_(config), caches_(config), rob_(require_u16(config, parameter(bindings, Model::ROB))),
+        lq_(require_u16(config, parameter(bindings, Model::LQ))),
+        sq_(require_u16(config, parameter(bindings, Model::SQ))),
+        icache_(require_u16(config, parameter(bindings, Model::ICACHE))),
         l1d_miss_(false), l2_miss_(true),
-        decode_(require_u16(config, parameter(mechanisms, Model::WIDTH, "decode_width"))),
-        rename_(require_u16(config, parameter(mechanisms, Model::WIDTH, "rename_width"))),
-        commit_(require_u16(config, parameter(mechanisms, Model::WIDTH, "commit_width"))) {}
+        decode_(require_u16(config, parameter(bindings, Model::WIDTH, "decode_width"))),
+        rename_(require_u16(config, parameter(bindings, Model::WIDTH, "rename_width"))),
+        commit_(require_u16(config, parameter(bindings, Model::WIDTH, "commit_width"))) {}
   void process(const Instr& macro) {
     icache_.process(caches_.instruction(macro.IP));
     for (const auto& op : macro.micro_ops) {
@@ -307,11 +307,10 @@ class ConfigAnalyzer {
     decode_.add(macro.micro_ops.size()); rename_.add(macro.micro_ops.size()); commit_.add(macro.micro_ops.size());
     ++macros_;
   }
-  std::vector<double> snapshot(const std::vector<MechanismBinding>& mechanisms) {
+  std::vector<double> snapshot(const std::vector<Binding>& bindings) {
     std::vector<double> values;
-    values.reserve(mechanisms.size());
-    for (const auto& mechanism : mechanisms) {
-      const Binding binding = parse_binding(mechanism);
+    values.reserve(bindings.size());
+    for (const auto& binding : bindings) {
       const uint16_t width = binding.parameter.empty() ? 0 : require_u16(config_, binding.parameter);
       switch (binding.model) {
         case Model::ROB: values.push_back(rob_.readout(macros_)); break;
@@ -339,9 +338,8 @@ class ConfigAnalyzer {
     return values;
   }
  private:
-  static std::string parameter(const std::vector<MechanismBinding>& mechanisms, Model wanted, const std::string& fallback = {}) {
-    for (const auto& mechanism : mechanisms) {
-      const Binding binding = parse_binding(mechanism);
+  static std::string parameter(const std::vector<Binding>& bindings, Model wanted, const std::string& fallback = {}) {
+    for (const auto& binding : bindings) {
       if (binding.model == wanted && (fallback.empty() || binding.parameter == fallback)) return binding.parameter;
     }
     throw std::runtime_error("Anamol canonical mechanism is missing");
@@ -356,22 +354,30 @@ size_t feature_count(const std::vector<MechanismBinding>& mechanisms) { return m
 std::vector<double> analyze_trace_windows(const std::vector<Instr>& instrs, int full_roi_window_size,
                                           int analysis_window_size, size_t requested_window_count,
                                           const std::vector<ConfigValues>& configs,
-                                          const std::vector<MechanismBinding>& mechanisms) {
+                                          const std::vector<MechanismBinding>& mechanisms,
+                                          int config_threads) {
   if (full_roi_window_size <= 0 || analysis_window_size <= 0 || configs.empty() || mechanisms.empty())
     throw std::runtime_error("invalid Anamol full-ROI analysis arguments");
   const size_t full = static_cast<size_t>(full_roi_window_size), analysis = static_cast<size_t>(analysis_window_size);
   if (full % analysis != 0 || requested_window_count < 2 || requested_window_count > instrs.size() / full)
     throw std::runtime_error("Anamol requires at least two complete, evenly divisible full-ROI windows");
   const size_t feature_columns = feature_count(mechanisms);
+  std::vector<Binding> bindings;
+  bindings.reserve(mechanisms.size());
+  for (const auto& mechanism : mechanisms) bindings.push_back(parse_binding(mechanism));
   std::vector<double> output(configs.size() * (requested_window_count - 1) * feature_columns);
-  for (size_t config_index = 0; config_index < configs.size(); ++config_index) {
-    ConfigAnalyzer analyzer(configs[config_index], mechanisms);
+  if (config_threads <= 0)
+    throw std::runtime_error("Anamol config thread budget must be positive");
+#pragma omp parallel for schedule(static) num_threads(config_threads)
+  for (ptrdiff_t config_offset = 0; config_offset < static_cast<ptrdiff_t>(configs.size()); ++config_offset) {
+    const size_t config_index = static_cast<size_t>(config_offset);
+    ConfigAnalyzer analyzer(configs[config_index], bindings);
     std::vector<std::vector<double>> samples(mechanisms.size());
     size_t write_window = 0;
     for (size_t index = 0; index < requested_window_count * full; ++index) {
       analyzer.process(instrs[index]);
       if ((index + 1) % analysis == 0) {
-        const auto snapshot = analyzer.snapshot(mechanisms);
+        const auto snapshot = analyzer.snapshot(bindings);
         for (size_t mechanism = 0; mechanism < mechanisms.size(); ++mechanism) samples[mechanism].push_back(snapshot[mechanism]);
       }
       if ((index + 1) % full == 0) {

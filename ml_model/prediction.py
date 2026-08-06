@@ -1,395 +1,393 @@
-"""Canonical fixed-model training and leakage-free grouped evaluation."""
+"""Grouped evaluation and deployment training for the canonical surrogate."""
 
 from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
+import lightning as L
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from torch.utils.data import DataLoader, TensorDataset
+from torchmetrics import MeanMetric
 
 from .dataset_io import read_dataset_shards
-from .multitask import FittedMultiHead
-from .multitask import MultiHeadTraining
-from .multitask import fit_multihead
-from .multitask import fit_multihead_epochs
-from .multitask import predict_multihead
-from .multitask import regression_error_report
+from .error_metrics import compute_regression_metrics
+from .module import SurrogateModule, fit_normalization
+from .tasks import SurrogateTask
 
 
-@dataclass(frozen=True)
-class FeatureSet:
-    feature_set_id: str
-    columns: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class PredictionTask:
-    task_id: str
-    identity_columns: tuple[str, ...]
-    group_column: str
-    feature_set: FeatureSet
-    label_columns: tuple[str, ...]
-    output_metrics: tuple[str, ...]
-    training: MultiHeadTraining
-    num_threads: int
-    seed: int
-    evaluation_folds: int = 5
-    data_limitations: tuple[str, ...] = ()
-
-
-def train_prediction_task(
-    *, task: PredictionTask, dataset_dir: str | Path, output_dir: str | Path,
+def evaluate_surrogate(
+    *, task: SurrogateTask, dataset_dir: str | Path, output_dir: str | Path,
     workload_ids: tuple[str, ...] | None = None,
-) -> dict[str, object]:
-    """Fit one fixed scalar predictor per target on all selected data."""
-    frame = _read_task_frame(task, dataset_dir, workload_ids)
-    truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
-    features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
-    output = Path(output_dir)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    partial = output.with_name(f".{output.name}.partial")
-    shutil.rmtree(partial, ignore_errors=True)
-    partial.mkdir()
-    models = partial / "models"
-    models.mkdir()
-    selected: dict[str, dict[str, object]] = {}
-    paths: dict[str, str] = {}
-    for index, metric in enumerate(task.output_metrics):
-        fitted = fit_multihead_epochs(
-            training=task.training, features=features, labels=truth[:, index:index + 1],
-            epochs=task.training.max_epochs, seed=task.seed + index,
-            label_columns=(task.label_columns[index],),
+) -> dict[str, str]:
+    frame = _read_frame(task, dataset_dir, workload_ids)
+    groups = frame[task.group_column].astype(str).to_numpy()
+    unique_groups = np.unique(groups)
+    folds = min(task.evaluation_folds, len(unique_groups))
+    if folds < 3:
+        raise ValueError("surrogate grouped evaluation requires at least three workloads")
+    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
+    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    prediction = np.empty_like(labels)
+    reports: list[dict[str, object]] = []
+    splitter = GroupKFold(n_splits=folds, shuffle=True, random_state=task.seed)
+    for fold_index, (train_valid, test) in enumerate(splitter.split(features, labels, groups)):
+        train, valid = _train_validation_split(task, train_valid, groups)
+        module, _epoch = _fit_partition(
+            task, features[train], labels[train], features[valid], labels[valid],
+            Path(output_dir) / ".folds" / str(fold_index),
         )
-        candidate_id = f"singlehead:{task.feature_set.feature_set_id}:{metric}"
-        path = models / f"{candidate_id.replace(':', '_')}.pt"
-        torch.save(_checkpoint(fitted, task.feature_set.columns, (task.label_columns[index],), task, metric), path)
-        selected[metric] = {
-            "candidate_id": candidate_id, "predictor_kind": "singlehead",
-            "feature_set": task.feature_set.feature_set_id,
-        }
-        paths[candidate_id] = str(path.relative_to(partial))
-    report = {
-        "task_id": task.task_id,
-        "protocol": "full_dataset_deployment_training",
-        "samples": len(frame),
-        "workloads": int(frame["workload_id"].nunique()) if "workload_id" in frame else 0,
-        "configurations": int(frame["config_id"].nunique()) if "config_id" in frame else 0,
-        "selected": selected,
-    }
-    training_report = partial / "training_report.json"
-    training_report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    bundle = partial / "predictor_bundle.json"
-    bundle.write_text(json.dumps({
-        "task_id": task.task_id, "identity_columns": task.identity_columns,
-        "output_metrics": task.output_metrics, "selected": selected, "model_paths": paths,
-    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    from .inference import PredictorBundle
-
-    PredictorBundle(bundle, num_threads=task.num_threads)
-    previous = output.with_name(f".{output.name}.previous")
-    if previous.exists():
-        raise RuntimeError(f"previous deployment model directory exists: {previous}")
-    if output.exists():
-        output.replace(previous)
-    try:
-        partial.replace(output)
-    except BaseException:
-        if previous.exists():
-            previous.replace(output)
-        raise
-    shutil.rmtree(previous, ignore_errors=True)
-    return {
-        "bundle": str(output / bundle.name),
-        "training_report": str(output / training_report.name),
-    }
-
-
-def evaluate_prediction_task(
-    *, task: PredictionTask, dataset_dir: str | Path, output_dir: str | Path,
-    workload_ids: tuple[str, ...] | None = None,
-) -> dict[str, object]:
-    """Evaluate fixed scalar models with whole-group train/validation/test isolation."""
-    frame = _read_task_frame(task, dataset_dir, workload_ids)
-    values = frame[task.group_column].astype(str).to_numpy()
-    groups = tuple(sorted(set(values)))
-    evaluation_groups = groups
-    fold_count = min(task.evaluation_folds, len(evaluation_groups))
-    if fold_count < 3:
-        raise ValueError("grouped evaluation requires at least three groups")
-    truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
-    features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
-    prediction = np.empty_like(truth)
-    evaluated = np.zeros(len(frame), dtype=bool)
-    folds: list[dict[str, object]] = []
-    fold_groups = _group_folds(evaluation_groups, fold_count, task.seed)
-    for offset, heldout in enumerate(fold_groups):
-        validation_groups = fold_groups[(offset + 1) % len(fold_groups)]
-        test = np.isin(values, heldout)
-        valid = np.isin(values, validation_groups)
-        train = ~(test | valid)
-        evaluated |= test
-        fitted = fit_multihead(
-            training=task.training, train_x=features[train], train_y=truth[train],
-            validation_x=features[valid], validation_y=truth[valid], seed=task.seed + offset,
-            label_columns=task.label_columns,
-        )
-        prediction[test] = predict_multihead(fitted, features[test])
-        folds.append({
-            "heldout_groups": heldout,
-            "validation_groups": validation_groups,
-            "train_rows": int(train.sum()), "validation_rows": int(valid.sum()),
-            "test_rows": int(test.sum()), "epochs": fitted.epochs,
+        prediction[test] = _predict_array(module, features[test], task.batch_size)
+        reports.append({
+            "heldout_groups": sorted(set(groups[test])),
+            "train_rows": int(len(train)), "validation_rows": int(len(valid)), "test_rows": int(len(test)),
         })
-    destination = Path(output_dir)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    output = destination.with_name(f".{destination.name}.partial")
-    shutil.rmtree(output, ignore_errors=True)
-    output.mkdir()
-    oof_path = output / "oof_predictions.parquet"
-    evaluated_frame = frame.loc[evaluated]
-    evaluated_truth = truth[evaluated]
-    evaluated_prediction = prediction[evaluated]
-    _write_predictions(
-        evaluated_frame,
-        task,
-        evaluated_truth,
-        evaluated_prediction,
-        oof_path,
+    return _publish_evaluation(task, frame, labels, prediction, reports, output_dir)
+
+
+def evaluate_random_pair_surrogate(
+    *, task: SurrogateTask, dataset_dir: str | Path, output_dir: str | Path,
+    workload_ids: tuple[str, ...] | None = None,
+) -> dict[str, str]:
+    """Evaluate in-distribution random ROI/configuration pairs with a fixed split."""
+    frame = _read_frame(task, dataset_dir, workload_ids)
+    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
+    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    train, valid, test = _random_pair_split(len(frame), task.seed)
+    module, epochs = _fit_partition(
+        task, features[train], labels[train], features[valid], labels[valid],
+        Path(output_dir) / ".selection",
     )
-    if task.group_column == "config_id":
-        metric_report = {
-            "roi_weighted": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
-            "per_metric_absolute": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
-        }
-        primary_metric = _primary_metric("roi_weighted")
-    else:
-        metric_report = {
-            "roi_weighted": regression_error_report(task.label_columns, evaluated_truth, evaluated_prediction),
-            "macro_workload": _macro_workload_report(task, values[evaluated], evaluated_truth, evaluated_prediction),
-            "per_workload": _per_workload_report(task, values[evaluated], evaluated_truth, evaluated_prediction),
-        }
-        primary_metric = _primary_metric("macro_workload")
-    report = {
-        "task_id": task.task_id,
-        "protocol": "grouped_config_kfold" if task.group_column == "config_id" else "grouped_workload_kfold",
-        "generalization_scope": "held_out_configuration" if task.group_column == "config_id" else "joint_program_microarchitecture_ood",
-        "primary_metric": primary_metric,
-        "samples": int(evaluated.sum()), "groups": len(evaluation_groups),
-        "data_limitations": task.data_limitations,
-        "metrics": metric_report,
-        "outer_folds": folds,
-        "oof_predictions": str(destination / oof_path.name),
-    }
-    evaluation = output / "evaluation.json"
-    evaluation.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    previous = destination.with_name(f".{destination.name}.previous")
-    if previous.exists():
-        raise RuntimeError(f"previous evaluation directory exists: {previous}")
-    if destination.exists():
-        destination.replace(previous)
-    try:
-        output.replace(destination)
-    except BaseException:
-        if previous.exists():
-            previous.replace(destination)
-        raise
-    shutil.rmtree(previous, ignore_errors=True)
-    return {
-        "evaluation": str(destination / evaluation.name),
-        "oof_predictions": str(destination / oof_path.name),
-    }
+    prediction = _predict_array(module, features[test], task.batch_size)
+    return _publish_random_pair_evaluation(
+        task, frame.iloc[test].copy(), labels[test], prediction, output_dir,
+        train_rows=len(train), validation_rows=len(valid), epochs=epochs,
+    )
 
 
-def evaluate_family_variant_prediction_task(
-    *, task: PredictionTask, dataset_dir: str | Path, output_dir: str | Path,
-    workload_families: Mapping[str, tuple[str, str]], workload_ids: tuple[str, ...] | None = None,
-) -> dict[str, object]:
-    """Hold out one workload variant while retaining a sibling in training."""
-    frame = _read_task_frame(task, dataset_dir, workload_ids)
-    workloads = tuple(sorted(set(frame["workload_id"].astype(str))))
-    missing = set(workloads) - set(workload_families)
-    if missing:
-        raise ValueError(f"family-variant evaluation lacks workload identities: {sorted(missing)}")
-    families: dict[str, list[tuple[str, str]]] = {}
-    for workload in workloads:
-        family, variant = workload_families[workload]
-        families.setdefault(family, []).append((variant, workload))
-    for family, variants in families.items():
-        if len(variants) < 3 or len({variant for variant, _ in variants}) != len(variants):
-            raise ValueError(f"family-variant evaluation requires three distinct variants: {family}")
-    values = frame["workload_id"].astype(str).to_numpy()
-    truth = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
-    features = frame.loc[:, task.feature_set.columns].to_numpy(dtype=np.float32)
-    prediction = np.empty_like(truth)
-    evaluated = np.zeros(len(frame), dtype=bool)
-    folds: list[dict[str, object]] = []
-    for family in sorted(families):
-        variants = sorted(families[family])
-        for index, (_, heldout_workload) in enumerate(variants):
-            validation_workload = variants[(index + 1) % len(variants)][1]
-            test = values == heldout_workload
-            valid = values == validation_workload
-            train = ~(test | valid)
-            fitted = fit_multihead(
-                training=task.training, train_x=features[train], train_y=truth[train],
-                validation_x=features[valid], validation_y=truth[valid],
-                seed=task.seed + len(folds), label_columns=task.label_columns,
-            )
-            prediction[test] = predict_multihead(fitted, features[test])
-            evaluated |= test
-            folds.append({
-                "family": family, "heldout_workload": heldout_workload,
-                "validation_workload": validation_workload,
-                "train_workloads": sorted(set(values[train])), "train_rows": int(train.sum()),
-                "validation_rows": int(valid.sum()), "test_rows": int(test.sum()), "epochs": fitted.epochs,
-            })
-    destination = Path(output_dir)
+def train_surrogate(
+    *, task: SurrogateTask, dataset_dir: str | Path, output_dir: str | Path,
+    workload_ids: tuple[str, ...] | None = None,
+) -> dict[str, str]:
+    frame = _read_frame(task, dataset_dir, workload_ids)
+    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
+    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    groups = frame[task.group_column].astype(str).to_numpy()
+    train, valid = _train_validation_split(task, np.arange(len(frame)), groups)
+    selection_root = Path(output_dir) / ".selection"
+    _selected, epochs = _fit_partition(
+        task, features[train], labels[train], features[valid], labels[valid], selection_root,
+    )
+    shutil.rmtree(selection_root, ignore_errors=True)
+    L.seed_everything(task.seed, workers=True)
+    normalization = fit_normalization(features, labels, task.targets)
+    module = _module(task, normalization)
+    trainer = _trainer(task, max_epochs=epochs, callbacks=[])
+    trainer.fit(module, train_dataloaders=_loader(features, labels, task.batch_size, shuffle=True))
+    destination = Path(output_dir) / task.checkpoint_name
     destination.parent.mkdir(parents=True, exist_ok=True)
-    output = destination.with_name(f".{destination.name}.partial")
-    shutil.rmtree(output, ignore_errors=True)
-    output.mkdir()
-    oof_path = output / "oof_predictions.parquet"
-    _write_predictions(frame.loc[evaluated], task, truth[evaluated], prediction[evaluated], oof_path)
-    metric_report = {
-        "roi_weighted": regression_error_report(task.label_columns, truth[evaluated], prediction[evaluated]),
-        "macro_workload": _macro_workload_report(task, values[evaluated], truth[evaluated], prediction[evaluated]),
-        "per_workload": _per_workload_report(task, values[evaluated], truth[evaluated], prediction[evaluated]),
+    partial = destination.with_suffix(".ckpt.partial")
+    trainer.save_checkpoint(partial, weights_only=False)
+    partial.replace(destination)
+    return {"checkpoint": str(destination)}
+
+
+def compare_oof_evaluations(
+    *, task: SurrogateTask, current_oof_path: str | Path, historical_oof_path: str | Path,
+    output_path: str | Path,
+) -> dict[str, str]:
+    """Recompute both versions with the canonical metrics before comparison."""
+    current = _read_oof(task, current_oof_path)
+    historical = _read_oof(task, historical_oof_path)
+    identities = list(task.identity_columns)
+    if not current.loc[:, identities].equals(historical.loc[:, identities]):
+        raise ValueError("historical and current OOF predictions have different identities")
+    if not np.array_equal(_oof_matrix(current, task, "truth"), _oof_matrix(historical, task, "truth")):
+        raise ValueError("historical and current OOF predictions have different labels")
+    current_report = _metric_report(
+        task, current.loc[:, identities], _oof_matrix(current, task, "truth"), _oof_matrix(current, task, "prediction"),
+    )
+    historical_report = _metric_report(
+        task, historical.loc[:, identities], _oof_matrix(historical, task, "truth"), _oof_matrix(historical, task, "prediction"),
+    )
+    payload = {
+        "comparison_scope": "same_dataset_grouped_workload_oof_nonpaired_folds",
+        "interpretation": (
+            "Dataset identities are identical, but outer folds differ; comparison is directional. "
+            "The historical model included per-target adapter selection and isotonic calibration."
+        ),
+        "samples": int(len(current)),
+        "workload_groups": int(current[task.group_column].nunique()),
+        "metrics": _compare_metric_reports(historical_report, current_report),
     }
-    evaluation = output / "evaluation.json"
-    evaluation.write_text(json.dumps({
-        "task_id": task.task_id, "protocol": "leave_one_family_variant_out",
-        "generalization_scope": "unseen_workload_variant_with_seen_family", "primary_metric": _primary_metric("macro_workload"),
-        "samples": int(evaluated.sum()), "workloads": len(workloads), "families": len(families),
-        "data_limitations": task.data_limitations, "metrics": metric_report, "outer_folds": folds,
-        "oof_predictions": str(destination / oof_path.name),
-    }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    previous = destination.with_name(f".{destination.name}.previous")
-    if previous.exists():
-        raise RuntimeError(f"previous evaluation directory exists: {previous}")
-    if destination.exists():
-        destination.replace(previous)
-    try:
-        output.replace(destination)
-    except BaseException:
-        if previous.exists():
-            previous.replace(destination)
-        raise
-    shutil.rmtree(previous, ignore_errors=True)
-    return {"evaluation": str(destination / evaluation.name), "oof_predictions": str(destination / oof_path.name)}
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".partial")
+    partial.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    partial.replace(destination)
+    return {"comparison": str(destination)}
 
 
-def _read_task_frame(task, dataset_dir, workload_ids):
-    if len(task.label_columns) != len(task.output_metrics):
-        raise ValueError("task labels and output metrics differ")
+def _fit_partition(
+    task: SurrogateTask, train_x: np.ndarray, train_y: np.ndarray, valid_x: np.ndarray,
+    valid_y: np.ndarray, root: Path,
+) -> tuple[SurrogateModule, int]:
+    L.seed_everything(task.seed, workers=True)
+    normalization = fit_normalization(train_x, train_y, task.targets)
+    module = _module(task, normalization)
+    root.mkdir(parents=True, exist_ok=True)
+    checkpoint = ModelCheckpoint(
+        dirpath=root, filename="best", monitor="val/loss", mode="min", save_top_k=1,
+        auto_insert_metric_name=False,
+    )
+    stopping = EarlyStopping(monitor="val/loss", mode="min", patience=task.early_stopping_patience)
+    trainer = _trainer(task, max_epochs=task.max_epochs, callbacks=[checkpoint, stopping])
+    trainer.fit(
+        module,
+        train_dataloaders=_loader(train_x, train_y, task.batch_size, shuffle=True),
+        val_dataloaders=_loader(valid_x, valid_y, task.batch_size, shuffle=False),
+    )
+    if not checkpoint.best_model_path:
+        raise RuntimeError("surrogate training produced no checkpoint")
+    fitted = SurrogateModule.load_from_checkpoint(checkpoint.best_model_path, map_location="cpu")
+    return fitted, int(trainer.current_epoch + 1)
+
+
+def _module(task: SurrogateTask, normalization: dict[str, np.ndarray]) -> SurrogateModule:
+    return SurrogateModule(
+        feature_columns=task.feature_columns, targets=task.targets, hidden_dims=task.hidden_dims,
+        learning_rate=task.learning_rate, weight_decay=task.weight_decay,
+        **normalization,
+    )
+
+
+def _trainer(task: SurrogateTask, *, max_epochs: int, callbacks: list[object]) -> L.Trainer:
     torch.set_num_threads(task.num_threads)
-    columns = tuple(dict.fromkeys((*task.identity_columns, *task.label_columns, *task.feature_set.columns)))
+    return L.Trainer(
+        accelerator="cpu", devices=1, max_epochs=max_epochs, logger=False,
+        enable_progress_bar=False, enable_model_summary=False, callbacks=callbacks,
+        enable_checkpointing=bool(callbacks),
+        deterministic=True, num_sanity_val_steps=0,
+    )
+
+
+def _loader(features: np.ndarray, labels: np.ndarray, batch_size: int, *, shuffle: bool) -> DataLoader:
+    return DataLoader(
+        TensorDataset(torch.from_numpy(np.ascontiguousarray(features)), torch.from_numpy(np.ascontiguousarray(labels))),
+        batch_size=batch_size, shuffle=shuffle,
+    )
+
+
+def _predict_array(module: SurrogateModule, features: np.ndarray, batch_size: int) -> np.ndarray:
+    module.eval()
+    values: list[np.ndarray] = []
+    with torch.inference_mode():
+        for batch in DataLoader(torch.from_numpy(np.ascontiguousarray(features)), batch_size=batch_size):
+            predicted = module(batch).cpu().numpy()
+            if not np.isfinite(predicted).all():
+                raise ValueError("surrogate prediction produced non-finite values")
+            values.append(predicted)
+    return np.concatenate(values, axis=0).astype(np.float32, copy=False)
+
+
+def _train_validation_split(task: SurrogateTask, indices: np.ndarray, groups: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    selected_groups = groups[indices]
+    if len(set(selected_groups)) < 2:
+        raise ValueError("surrogate training requires at least two workload groups")
+    splitter = GroupShuffleSplit(n_splits=1, test_size=task.validation_fraction, random_state=task.seed)
+    train_local, valid_local = next(splitter.split(indices, groups=selected_groups))
+    return indices[train_local], indices[valid_local]
+
+
+def _random_pair_split(rows: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if rows < 3:
+        raise ValueError("random-pair evaluation requires at least three rows")
+    holdout = int(rows * 0.15)
+    if holdout < 1 or rows - 2 * holdout < 1:
+        raise ValueError("random-pair evaluation cannot allocate 70/15/15 rows")
+    permutation = np.random.default_rng(seed).permutation(rows)
+    test = permutation[:holdout]
+    valid = permutation[holdout:2 * holdout]
+    train = permutation[2 * holdout:]
+    return train, valid, test
+
+
+def _read_frame(task: SurrogateTask, dataset_dir: str | Path, workload_ids: tuple[str, ...] | None) -> pd.DataFrame:
+    columns = tuple(dict.fromkeys((*task.identity_columns, *task.feature_columns, *task.label_columns)))
     frame = read_dataset_shards(dataset_dir, columns=columns)
     if workload_ids is not None:
         frame = frame[frame["workload_id"].isin(workload_ids)].copy()
-    _validate_task_frame(task, frame)
+    required = set(columns)
+    if frame.empty or not required <= set(frame) or frame.duplicated(list(task.identity_columns)).any():
+        raise ValueError("surrogate dataset has invalid identities or columns")
+    numeric = frame.loc[:, [*task.feature_columns, *task.label_columns]].to_numpy(dtype=np.float64)
+    if not np.isfinite(numeric).all():
+        raise ValueError("surrogate dataset contains non-finite values")
     return frame
 
 
-def _group_folds(groups, count, seed):
-    shuffled = np.asarray(groups, dtype=object)[np.random.default_rng(seed).permutation(len(groups))]
-    return tuple(tuple(str(item) for item in fold) for fold in np.array_split(shuffled, count))
+def _read_oof(task: SurrogateTask, path: str | Path) -> pd.DataFrame:
+    frame = pq.read_table(path).to_pandas()
+    required = [
+        *task.identity_columns,
+        *(f"{kind}_{metric}" for kind in ("truth", "prediction") for metric in task.output_metrics),
+    ]
+    if frame.empty or not set(required) <= set(frame) or frame.duplicated(list(task.identity_columns)).any():
+        raise ValueError("OOF predictions have invalid identities or columns")
+    values = frame.loc[:, required[len(task.identity_columns):]].to_numpy(dtype=np.float64)
+    if not np.isfinite(values).all():
+        raise ValueError("OOF predictions contain non-finite values")
+    return frame.loc[:, required].copy()
 
 
-def _candidate_baseline_deltas(*, frame, metric_index, truth, candidate_prediction, candidate_mask, baseline_prediction):
-    keys = [name for name in ("workload_id", "window_index") if name in frame]
-    baseline = frame.loc[frame.config_id.astype(str) == "baseline", keys].copy()
-    baseline["truth_baseline"] = truth[frame.config_id.astype(str).to_numpy() == "baseline", metric_index]
-    baseline["prediction_baseline"] = baseline_prediction
-    candidate = frame.loc[candidate_mask, keys].copy()
-    candidate["truth_candidate"] = truth[candidate_mask, metric_index]
-    candidate["prediction_candidate"] = candidate_prediction
-    paired = candidate.merge(baseline, on=keys, validate="many_to_one")
-    return (
-        paired.truth_candidate.to_numpy() - paired.truth_baseline.to_numpy(),
-        paired.prediction_candidate.to_numpy() - paired.prediction_baseline.to_numpy(),
-    )
+def _oof_matrix(frame: pd.DataFrame, task: SurrogateTask, kind: str) -> np.ndarray:
+    return frame.loc[:, [f"{kind}_{metric}" for metric in task.output_metrics]].to_numpy(dtype=np.float32)
 
 
-def _delta_report(task, truth_parts, prediction_parts):
-    report = {}
-    if not truth_parts:
-        return report
-    truth = np.concatenate(truth_parts)
-    prediction = np.concatenate(prediction_parts)
-    for index, metric in enumerate(task.output_metrics):
-        selected = truth[:, 0] == index
-        report[metric] = regression_error_report(
-            (task.label_columns[index],), truth[selected, 1:2], prediction[selected, 1:2],
-        )[metric]
-    return report
-
-
-def _per_workload_report(task, values, truth, prediction):
-    return {
-        workload: regression_error_report(task.label_columns, truth[values == workload], prediction[values == workload])
-        for workload in sorted(set(values))
-    }
-
-
-def _primary_metric(aggregation):
-    return {"target": "CPI", "metric": "mape_pct", "aggregation": aggregation}
-
-
-def _macro_workload_report(task, values, truth, prediction):
-    per_workload = _per_workload_report(task, values, truth, prediction)
-    report: dict[str, dict[str, float | int | None]] = {}
-    for metric in task.output_metrics:
-        reports = [per_workload[workload][metric] for workload in per_workload]
-        report[metric] = {
-            key: _optional_mean(entry[key] for entry in reports)
-            for key in ("mae", "rmse", "mape_pct", "p90_absolute_error", "wape_pct", "smape_pct")
-        }
-        report[metric]["mape_nonzero_rows"] = int(sum(entry["mape_nonzero_rows"] for entry in reports))
-    return report
-
-
-def _optional_mean(values):
-    finite = [float(value) for value in values if value is not None]
-    return float(np.mean(finite)) if finite else None
-
-
-def _checkpoint(fitted: FittedMultiHead, features, labels, task, metric):
-    return {
-        "state_dict": fitted.model.state_dict(), "feature_columns": features,
-        "label_columns": labels, "output_metrics": (metric,),
-        "hidden_dims": task.training.hidden_dims, "num_threads": task.num_threads,
-        "feature_mean": torch.from_numpy(fitted.feature_mean), "feature_scale": torch.from_numpy(fitted.feature_scale),
-        "label_mean": torch.from_numpy(fitted.label_mean), "label_scale": torch.from_numpy(fitted.label_scale),
-        "target_transforms": fitted.target_transforms,
-    }
-
-
-def _write_predictions(
-    frame, task, truth, prediction, path, *, delta_truth=None, delta_prediction=None,
-):
+def _publish_evaluation(
+    task: SurrogateTask, frame: pd.DataFrame, labels: np.ndarray, prediction: np.ndarray,
+    folds: list[dict[str, object]], output_dir: str | Path,
+) -> dict[str, str]:
+    destination = Path(output_dir)
+    partial = destination.with_name(f".{destination.name}.partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(parents=True)
     table = pa.Table.from_pandas(frame.loc[:, task.identity_columns], preserve_index=False)
     for index, metric in enumerate(task.output_metrics):
-        table = table.append_column(f"truth_{metric}", pa.array(truth[:, index]))
+        table = table.append_column(f"truth_{metric}", pa.array(labels[:, index]))
         table = table.append_column(f"prediction_{metric}", pa.array(prediction[:, index]))
-        if delta_truth is not None and delta_prediction is not None:
-            table = table.append_column(f"truth_delta_{metric}", pa.array(delta_truth[:, index]))
-            table = table.append_column(f"prediction_delta_{metric}", pa.array(delta_prediction[:, index]))
-    pq.write_table(table, path, compression="zstd")
+    oof = partial / "oof_predictions.parquet"
+    pq.write_table(table, oof, compression="zstd")
+    payload = {
+        "protocol": "grouped_workload_kfold",
+        "metrics": _metric_report(task, frame, labels, prediction),
+        "outer_folds": folds, "samples": int(len(frame)), "groups": int(frame[task.group_column].nunique()),
+    }
+    report = partial / "evaluation.json"
+    report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if destination.exists():
+        shutil.rmtree(destination)
+    partial.replace(destination)
+    return {"evaluation": str(destination / report.name), "oof_predictions": str(destination / oof.name)}
 
 
-def _validate_task_frame(task, frame):
-    required = {*task.identity_columns, task.group_column, *task.label_columns, *task.feature_set.columns}
-    if frame.empty or not required <= set(frame) or frame.duplicated(list(task.identity_columns)).any():
-        raise ValueError("prediction task dataset has invalid identities or columns")
-    numeric = [*task.label_columns, *task.feature_set.columns]
-    if not np.isfinite(frame.loc[:, list(dict.fromkeys(numeric))].to_numpy(dtype=np.float64)).all():
-        raise ValueError("prediction task dataset contains non-finite values")
-    if (frame.loc[:, task.label_columns].nunique(dropna=False) <= 1).any():
-        raise ValueError("prediction task dataset has zero-variance labels")
+def _publish_random_pair_evaluation(
+    task: SurrogateTask, frame: pd.DataFrame, labels: np.ndarray, prediction: np.ndarray,
+    output_dir: str | Path, *, train_rows: int, validation_rows: int, epochs: int,
+) -> dict[str, str]:
+    destination = Path(output_dir)
+    partial = destination.with_name(f".{destination.name}.partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(parents=True)
+    table = pa.Table.from_pandas(frame.loc[:, task.identity_columns], preserve_index=False)
+    for index, metric in enumerate(task.output_metrics):
+        table = table.append_column(f"truth_{metric}", pa.array(labels[:, index]))
+        table = table.append_column(f"prediction_{metric}", pa.array(prediction[:, index]))
+    predictions = partial / "test_predictions.parquet"
+    pq.write_table(table, predictions, compression="zstd")
+    payload = {
+        "protocol": "random_pair_split",
+        "generalization_scope": "in_distribution_random_pair",
+        "metrics": _metric_report(task, frame, labels, prediction),
+        "samples": train_rows + validation_rows + len(frame),
+        "split": {
+            "seed": task.seed,
+            "train_rows": train_rows,
+            "validation_rows": validation_rows,
+            "test_rows": int(len(frame)),
+            "train_fraction": 0.70,
+            "validation_fraction": 0.15,
+            "test_fraction": 0.15,
+            "epochs": epochs,
+        },
+    }
+    report = partial / "evaluation.json"
+    report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if destination.exists():
+        shutil.rmtree(destination)
+    partial.replace(destination)
+    return {"evaluation": str(destination / report.name), "test_predictions": str(destination / predictions.name)}
+
+
+def _metric_report(
+    task: SurrogateTask, frame: pd.DataFrame, truth: np.ndarray, prediction: np.ndarray,
+) -> dict[str, object]:
+    per_workload: dict[str, dict[str, dict[str, float]]] = {}
+    for workload, indices in frame.groupby(task.group_column, sort=True).indices.items():
+        per_workload[str(workload)] = _metrics(task, truth[indices], prediction[indices])
+    return {
+        "macro_workload": _macro_metrics(per_workload),
+        "roi_weighted": _metrics(task, truth, prediction),
+        "per_workload": per_workload,
+    }
+
+
+def _metrics(task: SurrogateTask, truth: np.ndarray, prediction: np.ndarray) -> dict[str, dict[str, float]]:
+    report: dict[str, dict[str, float]] = {}
+    for index, spec in enumerate(task.targets):
+        report[spec.metric] = compute_regression_metrics(
+            spec.metric,
+            torch.from_numpy(prediction[:, index].copy()),
+            torch.from_numpy(truth[:, index].copy()),
+        )
+    return report
+
+
+def _macro_metrics(
+    per_workload: dict[str, dict[str, dict[str, float]]],
+) -> dict[str, dict[str, float]]:
+    metrics: dict[str, dict[str, MeanMetric]] = {}
+    for workload in per_workload.values():
+        for target, values in workload.items():
+            target_metrics = metrics.setdefault(target, {})
+            for name, value in values.items():
+                target_metrics.setdefault(name, MeanMetric()).update(torch.tensor(value))
+    return {
+        target: {name: float(metric.compute().item()) for name, metric in values.items()}
+        for target, values in metrics.items()
+    }
+
+
+def _compare_metric_reports(historical: dict[str, object], current: dict[str, object]) -> dict[str, object]:
+    comparison: dict[str, object] = {}
+    for aggregation in ("macro_workload", "roi_weighted", "per_workload"):
+        previous = historical[aggregation]
+        present = current[aggregation]
+        assert isinstance(previous, dict) and isinstance(present, dict)
+        aggregation_report: dict[str, object] = {}
+        comparison[aggregation] = aggregation_report
+        if aggregation == "per_workload":
+            for workload, previous_workload in previous.items():
+                current_workload = present[workload]
+                assert isinstance(previous_workload, dict) and isinstance(current_workload, dict)
+                aggregation_report[workload] = _compare_targets(previous_workload, current_workload)
+            continue
+        aggregation_report.update(_compare_targets(previous, present))
+    return comparison
+
+
+def _compare_targets(previous: dict[str, object], present: dict[str, object]) -> dict[str, object]:
+    target_report: dict[str, object] = {}
+    for target, previous_values in previous.items():
+        current_values = present[target]
+        assert isinstance(previous_values, dict) and isinstance(current_values, dict)
+        metric_report: dict[str, dict[str, float | None]] = {}
+        target_report[target] = metric_report
+        for name, old_value in previous_values.items():
+            new_value = current_values[name]
+            assert isinstance(old_value, float) and isinstance(new_value, float)
+            delta = new_value - old_value
+            metric_report[name] = {
+                "historical": old_value,
+                "current": new_value,
+                "delta_current_minus_historical": delta,
+                "relative_change_pct": delta / abs(old_value) * 100.0 if old_value else None,
+            }
+    return target_report

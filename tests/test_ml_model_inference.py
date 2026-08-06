@@ -1,706 +1,198 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import torch
 import pytest
+import torch
 
-from anamol.python.design_space import AnalysisConfig
-from anamol.python.design_space import CollectionSamplingConfig
-from anamol.python.design_space import EvaluationConfig
-from anamol.python.design_space import PeregrineConfig
-from anamol.python.design_space import TrainingConfig
-from anamol.python.design_space import load_peregrine_config
-from anamol.python.microarchitecture import load_microarchitecture_config
-from ml_model.inference import CpuMultiHeadPredictor
 from ml_model.inference import predict_parquet
-from ml_model.model import MultiHeadPeregrineModel
-from ml_model.multitask import LOG1P_NONNEGATIVE_TARGET_TRANSFORM
-from ml_model.multitask import MultiHeadTraining
-from ml_model.multitask import inverse_transform_targets
-from ml_model.multitask import regression_error_report
-from ml_model.multitask import scale
-from ml_model.multitask import standardize
-from ml_model.plots import plot_surrogate_summary
-from ml_model.prediction import FeatureSet
-from ml_model.prediction import PredictionTask
-from ml_model.prediction import _read_task_frame
-from ml_model.prediction import evaluate_prediction_task
-from ml_model.prediction import evaluate_family_variant_prediction_task
-from ml_model.prediction import train_prediction_task
-from ml_model.tasks import SURROGATE_TASK_ID
-from ml_model.tasks import surrogate_task
-from tests.helpers import METRICS_CONFIG
-from tests.helpers import MICROARCHITECTURE_CONFIG
-from tests.helpers import cpu_microarchitecture_root
+from ml_model.error_metrics import compute_regression_metrics
+from ml_model.model import BOUNDED_HEAD, POSITIVE_HEAD, ZERO_INFLATED_HEAD
+from ml_model.module import SurrogateModule, fit_normalization
+from ml_model.prediction import (
+    compare_oof_evaluations,
+    evaluate_random_pair_surrogate,
+    evaluate_surrogate,
+    _predict_array,
+    train_surrogate,
+)
+from ml_model.tasks import SurrogateTask, TargetSpec
 
 
-def test_prediction_task_bundle_uses_paths_relative_to_its_own_directory(tmp_path: Path, monkeypatch) -> None:
-    from ml_model.prediction import FeatureSet
-    from ml_model.prediction import PredictionTask
-    from ml_model.prediction import train_prediction_task
+def _task(*, epochs: int = 2) -> SurrogateTask:
+    return SurrogateTask(
+        identity_columns=("workload_id", "window_index", "config_id"), group_column="workload_id",
+        feature_columns=("f0", "f1"),
+        targets=(
+            TargetSpec("CPI", "label_CPI", POSITIVE_HEAD, "mape_pct"),
+            TargetSpec("BRANCH_RATE", "label_BRANCH_RATE", BOUNDED_HEAD, "mae"),
+            TargetSpec("BRANCH_MPKI", "label_BRANCH_MPKI", ZERO_INFLATED_HEAD, "mae"),
+        ),
+        hidden_dims=(8, 4), max_epochs=epochs, batch_size=4, learning_rate=0.01,
+        weight_decay=0.0, early_stopping_patience=1, num_threads=1, seed=7,
+        evaluation_folds=3, validation_fraction=0.25,
+    )
 
+
+def _frame() -> pd.DataFrame:
+    rows = []
+    for workload in range(6):
+        for window in range(3):
+            rows.append({
+                "workload_id": f"w{workload}", "window_index": window, "config_id": "c0",
+                "f0": float(workload), "f1": float(window), "label_CPI": float(workload + window + 1),
+                "label_BRANCH_RATE": float((workload + window + 1) / 10.0),
+                "label_BRANCH_MPKI": float((workload + window) % 3),
+            })
+    return pd.DataFrame(rows)
+
+
+def test_fixed_heads_decode_to_their_physical_domains() -> None:
+    task = _task()
+    frame = _frame()
+    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
+    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    module = SurrogateModule(
+        feature_columns=task.feature_columns, targets=task.targets, hidden_dims=task.hidden_dims,
+        learning_rate=task.learning_rate, weight_decay=task.weight_decay,
+        **fit_normalization(features, labels, task.targets),
+    )
+    values = module(torch.from_numpy(features.copy())).detach().numpy()
+    assert (values[:, 0] >= 0.0).all()
+    assert ((values[:, 1] >= 0.0) & (values[:, 1] <= 1.0)).all()
+    assert (values[:, 2] >= 0.0).all()
+
+
+def test_zero_inflated_head_accepts_all_zero_training_partition() -> None:
+    task = SurrogateTask(
+        identity_columns=("workload_id", "window_index", "config_id"), group_column="workload_id",
+        feature_columns=("f0",),
+        targets=(TargetSpec("TLB", "label_TLB", ZERO_INFLATED_HEAD, "mae"),),
+        hidden_dims=(8, 4), max_epochs=1, batch_size=4, learning_rate=0.01,
+        weight_decay=0.0, early_stopping_patience=1, num_threads=1, seed=7,
+        evaluation_folds=3, validation_fraction=0.25,
+    )
+    features = np.asarray([[0.0], [1.0], [2.0]], dtype=np.float32)
+    labels = np.zeros((3, 1), dtype=np.float32)
+
+    module = SurrogateModule(
+        feature_columns=task.feature_columns, targets=task.targets, hidden_dims=task.hidden_dims,
+        learning_rate=task.learning_rate, weight_decay=task.weight_decay,
+        **fit_normalization(features, labels, task.targets),
+    )
+    values = module(torch.from_numpy(features.copy())).detach().numpy()
+
+    assert np.isfinite(values).all()
+    assert (values[:, 0] >= 0.0).all()
+
+
+def test_prediction_array_rejects_non_finite_outputs() -> None:
+    class BadModule(torch.nn.Module):
+        def forward(self, features: torch.Tensor) -> torch.Tensor:
+            return torch.full((len(features), 1), float("nan"))
+
+    with pytest.raises(ValueError, match="non-finite"):
+        _predict_array(BadModule(), np.ones((2, 1), dtype=np.float32), batch_size=2)
+
+
+def test_train_checkpoint_drives_streaming_prediction(tmp_path: Path) -> None:
+    task = _task(epochs=1)
     dataset = tmp_path / "dataset"
     dataset.mkdir()
-    rows = []
-    for workload_index, workload in enumerate(("w0", "w1", "w2")):
-        for interval in range(2):
-            value = float(workload_index + interval + 1)
-            rows.append({
-                "workload_id": workload,
-                "interval_index": interval,
-                "feature_raw": value,
-                "feature_model": value,
-                "label_raw": value,
-                "label_model": value * 2.0,
-            })
-    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
-    task = PredictionTask(
-        task_id="synthetic",
-        identity_columns=("workload_id", "interval_index"),
-        group_column="workload_id",
-        feature_set=FeatureSet("core", ("feature_model",)),
-        label_columns=("label_raw", "label_model"),
-        output_metrics=("raw", "model"),
-        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
-        num_threads=1,
-        seed=7,
-    )
-
-    monkeypatch.chdir(tmp_path)
-    report = train_prediction_task(task=task, dataset_dir=dataset, output_dir=Path("model"))
-
-    training = json.loads(Path(report["training_report"]).read_text())
-    assert training["protocol"] == "full_dataset_deployment_training"
-    assert set(training["selected"]) == {"raw", "model"}
-    assert Path(report["bundle"]).is_file()
-    from ml_model.inference import PredictorBundle
-    PredictorBundle(report["bundle"])
-
-
-def test_predictor_bundle_combines_singlehead_outputs(tmp_path: Path) -> None:
-    from ml_model.inference import PredictorBundle
-    from ml_model.inference import predict_bundle_parquet
-
-    checkpoint = tmp_path / "model.pt"
-    model = MultiHeadPeregrineModel(1, (4, 3), ("label_raw",))
-    torch.save({
-        "state_dict": model.state_dict(), "feature_columns": ("feature_model",),
-        "label_columns": ("label_raw",), "output_metrics": ("raw",),
-        "hidden_dims": (4, 3), "num_threads": 1,
-        "feature_mean": torch.zeros(1), "feature_scale": torch.ones(1),
-        "label_mean": torch.zeros(1), "label_scale": torch.ones(1),
-    }, checkpoint)
-    model_output = tmp_path / "model-output.pt"
-    model = MultiHeadPeregrineModel(1, (4, 3), ("label_model",))
-    torch.save({
-        "state_dict": model.state_dict(), "feature_columns": ("feature_model",),
-        "label_columns": ("label_model",), "output_metrics": ("model",),
-        "hidden_dims": (4, 3), "num_threads": 1,
-        "feature_mean": torch.zeros(1), "feature_scale": torch.ones(1),
-        "label_mean": torch.zeros(1), "label_scale": torch.ones(1),
-    }, model_output)
-    bundle_path = tmp_path / "predictor_bundle.json"
-    bundle_path.write_text(json.dumps({
-        "task_id": "synthetic", "identity_columns": ["workload_id", "interval_index"],
-        "output_metrics": ["raw", "model"],
-        "selected": {
-            "raw": {"candidate_id": "singlehead:core:raw", "predictor_kind": "singlehead", "feature_set": "core"},
-            "model": {"candidate_id": "singlehead:core:model", "predictor_kind": "singlehead", "feature_set": "core"},
-        },
-        "model_paths": {"singlehead:core:raw": str(checkpoint), "singlehead:core:model": str(model_output)},
-    }))
-    source = tmp_path / "features.parquet"
-    pd.DataFrame({
-        "workload_id": ["w0"], "interval_index": [0],
-        "feature_raw": [3.0], "feature_model": [2.0],
-    }).to_parquet(source, index=False)
-    destination = tmp_path / "prediction.parquet"
-
-    report = predict_bundle_parquet(
-        predictor=PredictorBundle(bundle_path), features_path=source, output_path=destination,
-    )
-
-    table = pq.read_table(destination)
-    assert report["rows"] == 1
-    assert table.column_names == ["workload_id", "interval_index", "prediction_raw", "prediction_model"]
-
-
-def test_checkpoint_drives_dynamic_prediction_outputs(tmp_path: Path) -> None:
-    feature_columns = ("f0", "f1")
-    label_columns = (
-        "label_CPI",
-        "label_BRANCH_RATE",
-        "label_MEM_ACCESS_PER_KI",
-        "label_BRANCH_MPKI",
-        "label_ICACHE_MPKI",
-        "label_L1D_MPKI",
-        "label_L2_MPKI",
-    )
-    output_metrics = tuple(label.removeprefix("label_") for label in label_columns)
-    model = MultiHeadPeregrineModel(len(feature_columns), (4, 3), label_columns)
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "feature_columns": feature_columns,
-            "label_columns": label_columns,
-            "output_metrics": output_metrics,
-            "hidden_dims": (4, 3),
-            "num_threads": 1,
-            "feature_mean": torch.zeros(len(feature_columns)),
-            "feature_scale": torch.ones(len(feature_columns)),
-            "label_mean": torch.zeros(len(label_columns)),
-            "label_scale": torch.ones(len(label_columns)),
-        },
-        checkpoint,
-    )
-    features = tmp_path / "features.parquet"
-    pd.DataFrame(
-        {
-            "workload_id": ["w0", "w0", "w0"],
-            "region_id": ["window_0", "window_1", "window_2"],
-            "config_id": ["config_0", "config_0", "config_0"],
-            "f0": [1.0, 2.0, 3.0],
-            "f1": [4.0, 5.0, 6.0],
-        }
-    ).to_parquet(features, index=False)
-    output = tmp_path / "predictions.parquet"
-
+    _frame().to_parquet(dataset / "samples.parquet", index=False)
+    training = train_surrogate(task=task, dataset_dir=dataset, output_dir=tmp_path / "model")
+    output = tmp_path / "prediction.parquet"
     report = predict_parquet(
-        predictor=CpuMultiHeadPredictor(checkpoint),
-        features_path=features,
-        output_path=output,
+        checkpoint_path=training["checkpoint"], features_path=dataset / "samples.parquet", output_path=output,
         batch_size=2,
     )
-    predictions = pq.read_table(output)
-
-    assert report["rows"] == 3
-    assert predictions.column_names == [
-        "workload_id",
-        "region_id",
-        "config_id",
-        *(f"prediction_{metric}" for metric in output_metrics),
+    table = pq.read_table(output)
+    assert report["rows"] == len(_frame())
+    assert table.column_names == [
+        "workload_id", "window_index", "config_id", "prediction_CPI",
+        "prediction_BRANCH_RATE", "prediction_BRANCH_MPKI",
     ]
 
 
-def test_predict_array_is_batch_size_invariant(tmp_path: Path) -> None:
-    feature_columns = ("f0", "f1")
-    label_columns = ("label_CPI", "label_BRANCH_RATE")
-    model = MultiHeadPeregrineModel(len(feature_columns), (4, 3), label_columns)
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "feature_columns": feature_columns,
-            "label_columns": label_columns,
-            "output_metrics": ("CPI", "BRANCH_RATE"),
-            "hidden_dims": (4, 3),
-            "num_threads": 1,
-            "feature_mean": torch.zeros(len(feature_columns)),
-            "feature_scale": torch.ones(len(feature_columns)),
-            "label_mean": torch.zeros(len(label_columns)),
-            "label_scale": torch.ones(len(label_columns)),
-        },
-        checkpoint,
-    )
-    predictor = CpuMultiHeadPredictor(checkpoint)
-    assert torch.get_num_threads() == 1
-    features = __import__("numpy").array(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]],
-        dtype="float32",
-    )
-
-    small = predictor.predict_array(features, batch_size=2)
-    large = predictor.predict_array(features, batch_size=16)
-
-    assert __import__("numpy").allclose(small, large)
-    assert small.shape == (5, 2)
-
-
-def test_log1p_nonnegative_checkpoint_clamps_physical_predictions(tmp_path: Path) -> None:
-    feature_columns = ("f0",)
-    label_columns = ("label_CPI",)
-    model = MultiHeadPeregrineModel(len(feature_columns), (4, 3), label_columns)
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "feature_columns": feature_columns,
-            "label_columns": label_columns,
-            "output_metrics": ("CPI",),
-            "hidden_dims": (4, 3),
-            "num_threads": 1,
-            "feature_mean": torch.zeros(len(feature_columns)),
-            "feature_scale": torch.ones(len(feature_columns)),
-            "label_mean": torch.full((1,), -100.0),
-            "label_scale": torch.ones(len(label_columns)),
-            "target_transforms": (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,),
-        },
-        checkpoint,
-    )
-    predictor = CpuMultiHeadPredictor(checkpoint)
-    predictions = predictor.predict_array(__import__("numpy").array([[0.0], [1.0]], dtype="float32"))
-
-    assert (predictions >= 0.0).all()
-    assert predictor.target_transforms == (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,)
-
-
-def test_workload_grouped_evaluation_uses_shared_report_contract(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    pd.DataFrame(
-        {
-            "workload_id": ["w0", "w0", "w1", "w1", "w2", "w2"],
-            "region_id": [f"window_{index}" for index in range(6)],
-            "config_id": ["config_0"] * 6,
-            "f0": [0.0, 0.1, 1.0, 1.1, 2.0, 2.1],
-            "f1": [1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
-            "label_CPI": [1.0, 1.1, 2.0, 2.1, 3.0, 3.1],
-        }
-    ).to_parquet(dataset / "samples.parquet", index=False)
-    task = _test_task(feature_columns=("f0", "f1"), label_columns=("label_CPI",), output_metrics=("CPI",))
-    report = evaluate_prediction_task(task=task, dataset_dir=dataset, output_dir=tmp_path / "evaluation")
-    evaluation = json.loads(Path(report["evaluation"]).read_text())
-    assert evaluation["primary_metric"] == {
-        "aggregation": "macro_workload", "metric": "mape_pct", "target": "CPI",
-    }
-    errors = evaluation["metrics"]["roi_weighted"]["CPI"]
-    assert set(errors) == {
-        "mae", "rmse", "mape_pct", "mape_nonzero_rows",
-        "p90_absolute_error", "wape_pct", "smape_pct",
-    }
-    assert all(__import__("numpy").isfinite(errors[name]) for name in ("mae", "rmse", "mape_pct", "p90_absolute_error", "wape_pct", "smape_pct"))
-
-
-def test_family_variant_evaluation_keeps_the_third_variant_in_training(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    rows = []
-    variants = ("small", "base", "large")
-    for family in ("a", "b"):
-        for variant_index, variant in enumerate(variants):
-            workload = f"{family}__{variant}"
-            for window in range(2):
-                value = float(variant_index + window + (10 if family == "b" else 1))
-                rows.append({
-                    "workload_id": workload, "region_id": f"r{window}", "config_id": "config_0",
-                    "f0": value, "f1": value + 0.5, "label_CPI": value,
-                })
-    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
-    task = _test_task(feature_columns=("f0", "f1"), label_columns=("label_CPI",), output_metrics=("CPI",))
-    families = {f"{family}__{variant}": (family, variant) for family in ("a", "b") for variant in variants}
-
-    report = evaluate_family_variant_prediction_task(
-        task=task, dataset_dir=dataset, output_dir=tmp_path / "evaluation", workload_families=families,
-    )
-    evaluation = json.loads(Path(report["evaluation"]).read_text())
-
-    assert evaluation["protocol"] == "leave_one_family_variant_out"
-    assert len(evaluation["outer_folds"]) == 6
-    base_fold = next(fold for fold in evaluation["outer_folds"] if fold["heldout_workload"] == "a__base")
-    assert base_fold["validation_workload"] == "a__large"
-    assert "a__small" in base_fold["train_workloads"]
-
-
-def test_prediction_failure_does_not_replace_existing_output(tmp_path: Path) -> None:
-    feature_columns = ("f0",)
-    label_columns = ("label_CPI",)
-    model = MultiHeadPeregrineModel(1, (4, 3), label_columns)
-    checkpoint = tmp_path / "checkpoint.pt"
-    torch.save(
-        {
-            "state_dict": model.state_dict(), "feature_columns": feature_columns,
-            "label_columns": label_columns, "output_metrics": ("CPI",),
-            "hidden_dims": (4, 3), "feature_mean": torch.zeros(1),
-            "num_threads": 1,
-            "feature_scale": torch.ones(1), "label_mean": torch.zeros(1),
-            "label_scale": torch.ones(1),
-        },
-        checkpoint,
-    )
-    features = tmp_path / "features.parquet"
-    pd.DataFrame(
-        {
-            "workload_id": ["w0", "w0"], "region_id": ["r0", "r1"],
-            "config_id": ["c0", "c1"], "f0": [1.0, float("nan")],
-        }
-    ).to_parquet(features, index=False)
-    output = tmp_path / "predictions.parquet"
-    output.write_bytes(b"previous-output")
-
-    with pytest.raises(ValueError, match="invalid inference feature matrix"):
-        predict_parquet(
-            predictor=CpuMultiHeadPredictor(checkpoint),
-            features_path=features,
-            output_path=output,
-            batch_size=1,
-        )
-
-    assert output.read_bytes() == b"previous-output"
-    assert not output.with_suffix(".parquet.partial").exists()
-
-
-def test_training_rejects_a_constant_label(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    pd.DataFrame(
-        {
-            "workload_id": ["w0", "w1"], "region_id": ["r0", "r1"],
-            "config_id": ["c0", "c1"], "f0": [0.0, 1.0],
-            "label_constant": [0.0, 0.0],
-        }
-    ).to_parquet(dataset / "samples.parquet", index=False)
-
-    with pytest.raises(ValueError, match="zero-variance labels"):
-        train_prediction_task(
-            task=_test_task(feature_columns=("f0",), label_columns=("label_constant",), output_metrics=("constant",)),
-            dataset_dir=dataset, output_dir=tmp_path / "model",
-        )
-
-
-def test_shared_error_report_uses_percentage_units_and_zero_safe_mape() -> None:
-    report = regression_error_report(
-        ("label_CPI",),
-        __import__("numpy").array([[0.0], [2.0]], dtype="float32"),
-        __import__("numpy").array([[1.0], [1.0]], dtype="float32"),
-    )["CPI"]
-
-    assert report["mae"] == 1.0
-    assert report["rmse"] == 1.0
-    assert report["mape_pct"] == 50.0
-    assert report["mape_nonzero_rows"] == 1
-    assert report["p90_absolute_error"] == 1.0
-    assert report["wape_pct"] == 100.0
-    assert report["smape_pct"] == pytest.approx(133.33333333333334)
-
-
-def test_macro_workload_mape_does_not_follow_roi_sample_counts() -> None:
-    from ml_model.prediction import _macro_workload_report
-
-    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
-    values = __import__("numpy").array(["small", "large", "large", "large"])
-    truth = __import__("numpy").full((4, 1), 10.0, dtype="float32")
-    prediction = __import__("numpy").array([[0.0], [10.0], [10.0], [10.0]], dtype="float32")
-
-    macro = _macro_workload_report(task, values, truth, prediction)["CPI"]
-    roi = regression_error_report(task.label_columns, truth, prediction)["CPI"]
-
-    assert macro["mape_pct"] == 50.0
-    assert roi["mape_pct"] == 25.0
-
-
-def test_macro_workload_report_preserves_optional_percentage_metrics() -> None:
-    from ml_model.prediction import _macro_workload_report
-
-    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
-    values = __import__("numpy").array(["zero", "nonzero"])
-    truth = __import__("numpy").array([[0.0], [10.0]], dtype="float32")
-    prediction = __import__("numpy").array([[1.0], [5.0]], dtype="float32")
-
-    macro = _macro_workload_report(task, values, truth, prediction)["CPI"]
-
-    assert macro["mae"] == 3.0
-    assert macro["mape_pct"] == 50.0
-    assert macro["mape_nonzero_rows"] == 1
-    assert macro["wape_pct"] == 50.0
-
-
-def test_log1p_inverse_transform_is_nonnegative() -> None:
-    restored = inverse_transform_targets(
-        __import__("numpy").array([[-100.0], [0.0], [100.0]], dtype="float32"),
-        (LOG1P_NONNEGATIVE_TARGET_TRANSFORM,),
-    )
-
-    assert (restored >= 0.0).all()
-    assert __import__("numpy").isfinite(restored).all()
-
-
-def test_standardize_bounds_a_constant_training_feature_outside_support() -> None:
-    mean, scale_value = standardize(__import__("numpy").array([[400.0], [400.0]], dtype="float32"))
-    heldout = scale(__import__("numpy").array([[100.0]], dtype="float32"), mean, scale_value)
-
-    assert scale_value.tolist() == [1.0]
-    assert heldout.tolist() == [[-8.0]]
-
-
-def test_surrogate_task_uses_one_full_feature_singlehead_protocol() -> None:
-    task = surrogate_task(load_peregrine_config(
-        cpu_microarchitecture_root() / "peregrine/configs/peregrine.yaml", metrics_config=METRICS_CONFIG,
-        microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
-    ))
-
-    assert task.feature_set.feature_set_id == "trace_design"
-    assert task.identity_columns == ("workload_id", "window_index", "config_id")
-    assert task.group_column == "config_id"
-
-
-def test_workload_grouped_evaluation_excludes_heldout_labels_from_its_prediction(tmp_path: Path) -> None:
-    def write_dataset(path: Path, heldout_offset: float) -> None:
-        path.mkdir()
-        rows = []
-        for workload_index, workload in enumerate(("w0", "w1", "w2", "w3")):
-            for interval in range(3):
-                rows.append({
-                    "workload_id": workload, "region_id": f"{workload}_{interval}",
-                    "config_id": f"c_{workload}_{interval}", "f0": float(workload_index + interval),
-                    "label_CPI": float(workload_index + interval + 1 + (heldout_offset if workload == "w0" else 0.0)),
-                })
-        pd.DataFrame(rows).to_parquet(path / "samples.parquet", index=False)
-
+def test_grouped_oof_does_not_fit_heldout_workload_labels(tmp_path: Path) -> None:
+    task = _task(epochs=1)
     first, second = tmp_path / "first", tmp_path / "second"
-    write_dataset(first, 0.0)
-    write_dataset(second, 100.0)
-    task = _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",))
-
-    first_report = evaluate_prediction_task(task=task, dataset_dir=first, output_dir=tmp_path / "first-evaluation")
-    second_report = evaluate_prediction_task(task=task, dataset_dir=second, output_dir=tmp_path / "second-evaluation")
-
-    first_oof = pd.read_parquet(first_report["oof_predictions"])
-    second_oof = pd.read_parquet(second_report["oof_predictions"])
-    first_w0 = first_oof.loc[first_oof.workload_id == "w0", "prediction_CPI"].to_numpy()
-    second_w0 = second_oof.loc[second_oof.workload_id == "w0", "prediction_CPI"].to_numpy()
-    evaluation = json.loads(Path(first_report["evaluation"]).read_text())
-    assert __import__("numpy").allclose(first_w0, second_w0)
-    assert evaluation["protocol"] == "grouped_workload_kfold"
-    assert evaluation["generalization_scope"] == "joint_program_microarchitecture_ood"
-    assert not (tmp_path / "first-evaluation" / "predictor_bundle.json").exists()
-
-
-def test_config_evaluation_keeps_every_config_out_of_fit_and_validation(tmp_path: Path) -> None:
-    def write_dataset(path: Path, heldout_offset: float) -> None:
-        path.mkdir()
-        rows = []
-        for config_id in ("baseline", *(f"c{index}" for index in range(6))):
-            config_index = 0 if config_id == "baseline" else int(config_id[1:])
-            for workload_index in range(2):
-                for window_index in range(2):
-                    rows.append({
-                        "workload_id": f"w{workload_index}", "window_index": window_index,
-                        "config_id": config_id, "f0": float(config_index + workload_index + window_index),
-                        "label_CPI": float(config_index + workload_index + window_index + 1 + (heldout_offset if config_id == "c0" else 0.0)),
-                    })
-        pd.DataFrame(rows).to_parquet(path / "samples.parquet", index=False)
-
-    first, second = tmp_path / "first-config", tmp_path / "second-config"
-    write_dataset(first, 0.0)
-    write_dataset(second, 100.0)
-    task = replace(
-        _test_task(feature_columns=("f0",), label_columns=("label_CPI",), output_metrics=("CPI",)),
-        identity_columns=("workload_id", "window_index", "config_id"),
-        group_column="config_id", evaluation_folds=3,
+    first.mkdir()
+    second.mkdir()
+    baseline = _frame()
+    changed = baseline.copy()
+    changed.loc[changed.workload_id == "w0", "label_CPI"] += 1000.0
+    baseline.to_parquet(first / "samples.parquet", index=False)
+    changed.to_parquet(second / "samples.parquet", index=False)
+    first_result = evaluate_surrogate(task=task, dataset_dir=first, output_dir=tmp_path / "first-evaluation")
+    second_result = evaluate_surrogate(task=task, dataset_dir=second, output_dir=tmp_path / "second-evaluation")
+    left = pd.read_parquet(first_result["oof_predictions"])
+    right = pd.read_parquet(second_result["oof_predictions"])
+    assert np.allclose(
+        left.loc[left.workload_id == "w0", "prediction_CPI"],
+        right.loc[right.workload_id == "w0", "prediction_CPI"],
     )
 
-    first_report = evaluate_prediction_task(task=task, dataset_dir=first, output_dir=tmp_path / "first-config-eval")
-    second_report = evaluate_prediction_task(task=task, dataset_dir=second, output_dir=tmp_path / "second-config-eval")
-    first_prediction = pd.read_parquet(first_report["oof_predictions"])
-    second_prediction = pd.read_parquet(second_report["oof_predictions"])
-    first_c0 = first_prediction.loc[first_prediction.config_id == "c0", "prediction_CPI"].to_numpy()
-    second_c0 = second_prediction.loc[second_prediction.config_id == "c0", "prediction_CPI"].to_numpy()
-    evaluation = json.loads(Path(first_report["evaluation"]).read_text())
 
-    assert __import__("numpy").allclose(first_c0, second_c0)
-    assert set(first_prediction.config_id) == {"baseline", *(f"c{index}" for index in range(6))}
-    assert evaluation["metrics"]["per_metric_absolute"]["CPI"]["mae"] is not None
-    assert evaluation["protocol"] == "grouped_config_kfold"
-    assert evaluation["generalization_scope"] == "held_out_configuration"
-    for fold in evaluation["outer_folds"]:
-        assert not set(fold["heldout_groups"]) & set(fold["validation_groups"])
-    assert "retrieval" not in evaluation
-
-
-def test_l1_plot_summary_writes_three_core_figures(tmp_path: Path) -> None:
+def test_official_metric_contract_is_target_aware_and_grouped(tmp_path: Path) -> None:
+    task = _task(epochs=1)
     dataset = tmp_path / "dataset"
-    generalization = tmp_path / "config_generalization"
-    random_roi = tmp_path / "evaluation"
-    plots = tmp_path / "plots"
     dataset.mkdir()
-    generalization.mkdir()
-    random_roi.mkdir()
-    metrics = (
+    _frame().to_parquet(dataset / "samples.parquet", index=False)
+    result = evaluate_surrogate(task=task, dataset_dir=dataset, output_dir=tmp_path / "evaluation")
+    report = json.loads(Path(result["evaluation"]).read_text())
+    metrics = report["metrics"]
+    assert set(metrics) == {"macro_workload", "roi_weighted", "per_workload"}
+    assert "mape_pct" in metrics["roi_weighted"]["CPI"]
+    assert "mape_pct" in metrics["roi_weighted"]["BRANCH_RATE"]
+    assert "mape_pct" not in metrics["roi_weighted"]["BRANCH_MPKI"]
+    assert "p90_absolute_error" not in metrics["roi_weighted"]["CPI"]
+    predictions = pd.read_parquet(result["oof_predictions"])
+    expected = compute_regression_metrics(
         "CPI",
-        "BRANCH_MPKI",
-        "CHI_L1I_IFETCH_MPKI",
-        "CHI_L1D_LD_MPKI",
-        "CHI_L2_LD_MPKI",
+        torch.tensor(predictions["prediction_CPI"].to_numpy()),
+        torch.tensor(predictions["truth_CPI"].to_numpy()),
     )
-    rows = []
-    predictions = []
-    for workload_index, workload in enumerate(("w0", "w1", "w2")):
-        for index in range(3):
-            row = {"workload_id": workload, "region_id": f"{workload}_{index}", "config_id": f"c{index}"}
-            pred = dict(row)
-            for metric_index, metric in enumerate(metrics):
-                truth = float((workload_index + 1) * (index + 1) * (metric_index + 1))
-                row[f"label_{metric}"] = truth
-                pred[f"truth_{metric}"] = truth
-                pred[f"prediction_{metric}"] = truth * (1.0 + 0.1 * (workload_index + 1))
-            rows.append(row)
-            predictions.append(pred)
-    pd.DataFrame(rows).to_parquet(dataset / "samples.parquet", index=False)
-    pd.DataFrame(predictions).to_parquet(generalization / "oof_predictions.parquet", index=False)
-    generalization_report = {
-        "task_id": SURROGATE_TASK_ID,
-        "generalization_scope": "held_out_configuration",
-        "metrics": {
-            "per_metric_absolute": {
-                metric: {"smape_pct": 10.0 + offset, "wape_pct": 11.0 + offset}
-                for offset, metric in enumerate(metrics)
-            },
-        },
-    }
-    (generalization / "evaluation.json").write_text(json.dumps(generalization_report), encoding="utf-8")
-    random_report = {
-        "task_id": SURROGATE_TASK_ID,
-        "protocol": "random_roi_split",
-        "metrics": {
-            "roi_weighted": {
-                metric: {"smape_pct": 2.0 + offset, "wape_pct": 3.0 + offset}
-                for offset, metric in enumerate(metrics)
-            },
-        },
-    }
-    (random_roi / "evaluation.json").write_text(json.dumps(random_report), encoding="utf-8")
+    assert metrics["roi_weighted"]["CPI"] == expected
 
-    report = plot_surrogate_summary(
-        dataset_dir=dataset,
-        config_generalization_dir=generalization,
-        random_roi_dir=random_roi,
-        output_dir=plots,
+
+def test_oof_comparison_recomputes_all_aggregations(tmp_path: Path) -> None:
+    task = _task(epochs=1)
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    baseline = _frame()
+    baseline.to_parquet(first / "samples.parquet", index=False)
+    baseline.to_parquet(second / "samples.parquet", index=False)
+    historical = evaluate_surrogate(task=task, dataset_dir=first, output_dir=tmp_path / "historical")
+    current = evaluate_surrogate(task=task, dataset_dir=second, output_dir=tmp_path / "current")
+    result = compare_oof_evaluations(
+        task=task, historical_oof_path=historical["oof_predictions"], current_oof_path=current["oof_predictions"],
+        output_path=tmp_path / "comparison.json",
     )
-    summary = json.loads(Path(report["summary"]).read_text(encoding="utf-8"))
-
-    assert summary["task_id"] == SURROGATE_TASK_ID
-    assert summary["metrics"] == list(metrics)
-    assert summary["protocol_errors"]["CPI"]["gap_smape_pct"] == 8.0
-    assert summary["workload_errors"]["CPI"]["w0"]["rows"] == 3
-    for path in summary["plots"].values():
-        assert Path(path).stat().st_size > 0
+    comparison = json.loads(Path(result["comparison"]).read_text())
+    assert comparison["samples"] == len(baseline)
+    assert set(comparison["metrics"]) == {"macro_workload", "roi_weighted", "per_workload"}
+    assert "mape_pct" not in comparison["metrics"]["roi_weighted"]["BRANCH_MPKI"]
 
 
-def test_l1_plot_summary_allows_missing_random_roi(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    generalization = tmp_path / "config_generalization"
-    plots = tmp_path / "plots"
-    dataset.mkdir()
-    generalization.mkdir()
-    metrics = (
-        "CPI",
-        "BRANCH_MPKI",
-        "CHI_L1I_IFETCH_MPKI",
-        "CHI_L1D_LD_MPKI",
-        "CHI_L2_LD_MPKI",
-    )
-    row = {"workload_id": "w0", "region_id": "r0", "config_id": "c0"}
-    prediction = dict(row)
-    for metric in metrics:
-        row[f"label_{metric}"] = 1.0
-        prediction[f"truth_{metric}"] = 1.0
-        prediction[f"prediction_{metric}"] = 1.0
-    pd.DataFrame([row]).to_parquet(dataset / "samples.parquet", index=False)
-    pd.DataFrame([prediction]).to_parquet(generalization / "oof_predictions.parquet", index=False)
-    (generalization / "evaluation.json").write_text(json.dumps({
-        "task_id": SURROGATE_TASK_ID,
-        "generalization_scope": "held_out_configuration",
-        "metrics": {
-            "per_metric_absolute": {
-                metric: {"smape_pct": 0.0, "wape_pct": 0.0}
-                for metric in metrics
-            },
-        },
-    }), encoding="utf-8")
-
-    report = plot_surrogate_summary(
-        dataset_dir=dataset,
-        config_generalization_dir=generalization,
-        random_roi_dir=tmp_path / "missing_random_roi",
-        output_dir=plots,
-    )
-
-    assert report["random_roi_available"] is False
-    assert report["protocol_errors"]["CPI"]["random_roi_smape_pct"] is None
-
-
-def test_surrogate_plot_summary_requires_config_generalization_artifacts(tmp_path: Path) -> None:
+def test_random_pair_evaluation_is_reproducible_and_reports_only_test_rows(tmp_path: Path) -> None:
+    task = _task(epochs=1)
     dataset = tmp_path / "dataset"
     dataset.mkdir()
-    pd.DataFrame({
-        "label_CPI": [1.0],
-        "label_BRANCH_MPKI": [1.0],
-        "label_CHI_L1I_IFETCH_MPKI": [1.0],
-        "label_CHI_L1D_LD_MPKI": [1.0],
-        "label_CHI_L2_LD_MPKI": [1.0],
-    }).to_parquet(dataset / "samples.parquet", index=False)
-
-    with pytest.raises(FileNotFoundError, match="missing surrogate held-out-configuration artifacts"):
-        plot_surrogate_summary(
-            dataset_dir=dataset,
-            config_generalization_dir=tmp_path / "missing_generalization",
-            random_roi_dir=tmp_path / "missing_random_roi",
-            output_dir=tmp_path / "plots",
-        )
-
-
-def test_workload_selection_is_independent_of_prediction_grouping(tmp_path: Path) -> None:
-    dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    pd.DataFrame({
-        "workload_id": ("work_a", "work_a", "work_b"),
-        "window_index": (0, 1, 0),
-        "config_id": ("config_a", "config_a", "config_a"),
-        "feature": (1.0, 2.0, 3.0),
-        "label": (1.0, 2.0, 3.0),
-    }).to_parquet(dataset / "samples.parquet", index=False)
-    task = PredictionTask(
-        task_id="prediction-test",
-        identity_columns=("workload_id", "window_index", "config_id"),
-        group_column="config_id",
-        feature_set=FeatureSet("trace_design", ("feature",)),
-        label_columns=("label",),
-        output_metrics=("metric",),
-        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
-        num_threads=1,
-        seed=7,
-    )
-
-    frame = _read_task_frame(task, dataset, ("work_a",))
-
-    assert frame["workload_id"].tolist() == ["work_a", "work_a"]
-
-
-def _training_config() -> PeregrineConfig:
-    return PeregrineConfig(
-        microarchitecture=load_microarchitecture_config(MICROARCHITECTURE_CONFIG),
-        analysis=AnalysisConfig(window_size=1),
-        collection_sampling=CollectionSamplingConfig(
-            seed=7,
-            configs_per_region=1,
-        ),
-        labels=(),
-        training=TrainingConfig(
-            max_epochs=2,
-            batch_size=2,
-            hidden_dims=(4, 3),
-            paper_test_fraction=0.33,
-            seed=7,
-            learning_rate=0.01,
-            weight_decay=0.0,
-            num_threads=1,
-            early_stopping_patience=2,
-        ),
-        evaluation=EvaluationConfig(config_folds=3),
-    )
-
-
-def _test_task(*, feature_columns: tuple[str, ...], label_columns: tuple[str, ...], output_metrics: tuple[str, ...]) -> PredictionTask:
-    return PredictionTask(
-        task_id="prediction-test", identity_columns=("workload_id", "region_id", "config_id"),
-        group_column="workload_id", feature_set=FeatureSet("trace_design", feature_columns),
-        label_columns=label_columns, output_metrics=output_metrics,
-        training=MultiHeadTraining((4, 3), 2, 2, 0.01, 0.0, 1),
-        num_threads=1, seed=7,
-    )
+    _frame().to_parquet(dataset / "samples.parquet", index=False)
+    first = evaluate_random_pair_surrogate(task=task, dataset_dir=dataset, output_dir=tmp_path / "first")
+    second = evaluate_random_pair_surrogate(task=task, dataset_dir=dataset, output_dir=tmp_path / "second")
+    report = json.loads(Path(first["evaluation"]).read_text())
+    left = pd.read_parquet(first["test_predictions"])
+    right = pd.read_parquet(second["test_predictions"])
+    assert report["protocol"] == "random_pair_split"
+    assert report["generalization_scope"] == "in_distribution_random_pair"
+    assert sum(report["split"][name] for name in ("train_rows", "validation_rows", "test_rows")) == len(_frame())
+    assert len(left) == report["split"]["test_rows"]
+    assert left.equals(right)
+    assert set(report["metrics"]) == {"macro_workload", "roi_weighted", "per_workload"}

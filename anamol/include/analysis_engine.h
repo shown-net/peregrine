@@ -26,7 +26,8 @@ std::vector<double> analyze_trace_windows(
     int analysis_window_size,
     size_t window_count,
     const std::vector<ConfigValues>& configs,
-    const std::vector<MechanismBinding>& mechanisms);
+    const std::vector<MechanismBinding>& mechanisms,
+    int config_threads);
 
 }  // namespace analytical
 

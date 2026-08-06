@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 
@@ -11,274 +11,211 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
+from matplotlib.lines import Line2D
 
-from .dataset_io import read_dataset_shards
-from .tasks import SURROGATE_TASK_ID
+from .error_metrics import compute_regression_metrics
 
 
-def plot_surrogate_summary(
+def plot_surrogate_generalization_errors(
     *,
-    dataset_dir: str | Path,
-    config_generalization_dir: str | Path,
-    random_roi_dir: str | Path,
+    workload_ood_dir: str | Path,
+    random_pair_dir: str | Path,
     output_dir: str | Path,
-) -> dict[str, Any]:
-    dataset_root = Path(dataset_dir)
-    generalization_root = Path(config_generalization_dir)
-    random_root = Path(random_roi_dir)
+) -> dict[str, dict[str, str]]:
+    """Render per-metric workload error plots for the two surrogate evaluations."""
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    generalization_evaluation_path = generalization_root / "evaluation.json"
-    generalization_predictions_path = generalization_root / "oof_predictions.parquet"
-    if not generalization_evaluation_path.is_file() or not generalization_predictions_path.is_file():
-        raise FileNotFoundError(
-            "missing surrogate held-out-configuration artifacts; run "
-            "`python -m src.cli modeling surrogate evaluate --protocol config-generalization` "
-            "from the cpu_microarchitecture repository"
+    evaluations = (
+        (
+            "workload_ood",
+            Path(workload_ood_dir),
+            "grouped_workload_kfold",
+            None,
+            "oof_predictions.parquet",
+            "Test-level aggregate: workload-macro (equal weight per workload)",
+        ),
+        (
+            "random_pair",
+            Path(random_pair_dir),
+            "random_pair_split",
+            "in_distribution_random_pair",
+            "test_predictions.parquet",
+            "Test-level aggregate: ROI-weighted (all test ROIs pooled)",
+        ),
+    )
+    plots: dict[str, dict[str, str]] = {}
+    for name, root, protocol, scope, predictions_name, aggregation_label in evaluations:
+        frame, metrics = _load_predictions(
+            root=root,
+            protocol=protocol,
+            generalization_scope=scope,
+            predictions_name=predictions_name,
         )
-    generalization_evaluation = _read_json(generalization_evaluation_path)
-    if (
-        generalization_evaluation.get("task_id") != SURROGATE_TASK_ID
-        or generalization_evaluation.get("generalization_scope") != "held_out_configuration"
-    ):
-        raise ValueError(f"configuration-generalization evaluation is not canonical surrogate: {generalization_evaluation_path}")
-    absolute = (generalization_evaluation.get("metrics") or {}).get("per_metric_absolute") or {}
-    metrics = tuple(absolute)
-    if not metrics:
-        raise ValueError("configuration-generalization evaluation has no configured metrics")
-    labels = tuple(f"label_{metric}" for metric in metrics)
-    label_frame = read_dataset_shards(dataset_root, columns=labels)
-    generalization_predictions = pd.read_parquet(generalization_predictions_path)
-    _require_prediction_columns(generalization_predictions, metrics)
-
-    random_evaluation_path = random_root / "evaluation.json"
-    random_evaluation = _read_json(random_evaluation_path) if random_evaluation_path.is_file() else None
-    if random_evaluation is not None and (
-        random_evaluation.get("task_id") != SURROGATE_TASK_ID
-        or random_evaluation.get("protocol") != "random_roi_split"
-    ):
-        raise ValueError(f"random-ROI evaluation is not a surrogate in-distribution diagnostic: {random_evaluation_path}")
-
-    label_plot = output / "surrogate_label_distributions.png"
-    protocol_plot = output / "surrogate_generalization_protocol_errors.png"
-    workload_plot = output / "surrogate_workload_error_points.png"
-    _plot_label_distributions(label_frame, metrics, label_plot)
-    _plot_protocol_errors(generalization_evaluation, random_evaluation, metrics, protocol_plot)
-    _plot_workload_error_points(generalization_predictions, metrics, workload_plot)
-
-    report = {
-        "task_id": SURROGATE_TASK_ID,
-        "metrics": list(metrics),
-        "artifact_inputs": {
-            "dataset_dir": str(dataset_root),
-            "config_generalization_evaluation": str(generalization_evaluation_path),
-            "config_generalization_predictions": str(generalization_predictions_path),
-            "random_roi_evaluation": str(random_evaluation_path) if random_evaluation else None,
-        },
-        "plots": {
-            "label_distributions": str(label_plot),
-            "generalization_protocol_errors": str(protocol_plot),
-            "workload_error_points": str(workload_plot),
-        },
-        "label_distribution": {
-            metric: _distribution(label_frame[f"label_{metric}"].to_numpy(dtype=np.float64))
+        destination = output / name
+        destination.mkdir(parents=True, exist_ok=True)
+        plots[name] = {
+            metric: str(
+                _plot_metric_errors(
+                    frame,
+                    metric,
+                    destination / f"{_safe_name(metric)}_smape.png",
+                    aggregation_label,
+                )
+            )
             for metric in metrics
-        },
-        "protocol_errors": _protocol_summary(generalization_evaluation, random_evaluation, metrics),
-        "workload_errors": _workload_summary(generalization_predictions, metrics),
-        "rows": {
-            "dataset": int(len(label_frame)),
-            "config_generalization": int(len(generalization_predictions)),
-        },
-        "random_roi_available": random_evaluation is not None,
-    }
-    summary_path = output / "l1_plot_summary.json"
-    summary_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {"summary": str(summary_path), **report}
+        }
+    return plots
 
 
-def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _load_predictions(
+    *,
+    root: Path,
+    protocol: str,
+    generalization_scope: str | None,
+    predictions_name: str,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    evaluation_path = root / "evaluation.json"
+    predictions_path = root / predictions_name
+    if not evaluation_path.is_file() or not predictions_path.is_file():
+        raise FileNotFoundError(f"missing evaluation artifacts under {root}")
+    evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
+    if evaluation.get("protocol") != protocol:
+        raise ValueError(f"unexpected evaluation protocol in {evaluation_path}: {evaluation.get('protocol')!r}")
+    if generalization_scope is not None and evaluation.get("generalization_scope") != generalization_scope:
+        raise ValueError(
+            f"unexpected evaluation scope in {evaluation_path}: {evaluation.get('generalization_scope')!r}"
+        )
+    frame = pd.read_parquet(predictions_path)
+    metrics = _prediction_metrics(frame)
+    _validate_predictions(frame, metrics, predictions_path)
+    return frame, metrics
 
 
-def _require_prediction_columns(frame: pd.DataFrame, metrics: tuple[str, ...]) -> None:
-    missing = [
-        column
-        for metric in metrics
-        for column in (f"truth_{metric}", f"prediction_{metric}")
-        if column not in frame
-    ]
+def _prediction_metrics(frame: pd.DataFrame) -> tuple[str, ...]:
+    metrics = tuple(sorted(column.removeprefix("truth_") for column in frame if column.startswith("truth_")))
+    if not metrics:
+        raise ValueError("surrogate prediction artifact has no truth_<metric> columns")
+    missing = [f"prediction_{metric}" for metric in metrics if f"prediction_{metric}" not in frame]
+    if missing:
+        raise ValueError(f"surrogate prediction artifact is missing paired columns: {missing}")
+    return metrics
+
+
+def _validate_predictions(frame: pd.DataFrame, metrics: tuple[str, ...], path: Path) -> None:
+    required = ("workload_id", "config_id")
+    missing = [column for column in required if column not in frame]
     if missing:
         raise ValueError(f"surrogate prediction artifact is missing columns: {missing}")
-    if "workload_id" not in frame:
-        raise ValueError("surrogate prediction artifact is missing workload_id")
+    if frame.empty or frame.loc[:, list(required)].isnull().any().any():
+        raise ValueError(f"surrogate prediction artifact has empty or incomplete identities: {path}")
+    values = frame.loc[:, [f"{kind}_{metric}" for metric in metrics for kind in ("truth", "prediction")]]
+    try:
+        numeric = values.to_numpy(dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"surrogate prediction artifact has non-numeric values: {path}") from exc
+    if not np.isfinite(numeric).all():
+        raise ValueError(f"surrogate prediction artifact has non-finite values: {path}")
 
 
-def _distribution(values: np.ndarray) -> dict[str, float]:
-    if values.size == 0:
-        raise ValueError("cannot summarize empty values")
-    return {
-        "min": float(np.min(values)),
-        "p50": float(np.percentile(values, 50)),
-        "mean": float(np.mean(values)),
-        "p90": float(np.percentile(values, 90)),
-        "max": float(np.max(values)),
-    }
-
-
-def _smape_percent(truth: np.ndarray, prediction: np.ndarray) -> np.ndarray:
-    denominator = np.abs(truth) + np.abs(prediction)
-    return np.divide(
-        200.0 * np.abs(truth - prediction),
-        denominator,
-        out=np.zeros_like(truth, dtype=np.float64),
-        where=denominator != 0.0,
+def _plot_metric_errors(frame: pd.DataFrame, metric: str, path: Path, aggregation_label: str) -> Path:
+    values = frame.loc[:, ["workload_id", "config_id", f"truth_{metric}", f"prediction_{metric}"]].copy()
+    families_variants = values["workload_id"].map(_family_variant)
+    values["workload_family"] = [item[0] for item in families_variants]
+    values["variant"] = [item[1] for item in families_variants]
+    summary = pd.DataFrame(
+        [
+            {
+                "workload_family": family,
+                "variant": variant,
+                "config_id": config,
+                "smape_pct": compute_regression_metrics(
+                    metric,
+                    torch.from_numpy(group[f"prediction_{metric}"].to_numpy(dtype=np.float32, copy=True)),
+                    torch.from_numpy(group[f"truth_{metric}"].to_numpy(dtype=np.float32, copy=True)),
+                )["smape_pct"],
+            }
+            for (family, variant, config), group in values.groupby(
+                ["workload_family", "variant", "config_id"], sort=True,
+            )
+        ]
     )
+    samples = values.groupby("workload_family", sort=True).size()
+    family_order = (
+        summary.groupby("workload_family", sort=True)["smape_pct"].max().sort_values(ascending=False, kind="stable").index.tolist()
+    )
+    configs = sorted(summary["config_id"].astype(str).unique())
+    variants = _ordered_variants(summary["variant"].astype(str).unique())
+    config_labels = {config: f"C{index}" for index, config in enumerate(configs, start=1)}
 
-
-def _error_summary(truth: np.ndarray, prediction: np.ndarray) -> dict[str, float | int | None]:
-    absolute = np.abs(truth - prediction).astype(np.float64)
-    magnitude = float(np.abs(truth).sum())
-    nonzero = truth != 0.0
-    return {
-        "rows": int(len(truth)),
-        "mae": float(np.mean(absolute)),
-        "median_smape_pct": float(np.percentile(_smape_percent(truth, prediction), 50)),
-        "p90_smape_pct": float(np.percentile(_smape_percent(truth, prediction), 90)),
-        "mean_smape_pct": float(np.mean(_smape_percent(truth, prediction))),
-        "wape_pct": float(absolute.sum() / magnitude * 100.0) if magnitude else None,
-        "mape_pct": float((absolute[nonzero] / np.abs(truth[nonzero])).mean() * 100.0)
-        if nonzero.any() else None,
-    }
-
-
-def _metric_report(evaluation: dict[str, Any] | None, aggregation: str, metric: str) -> dict[str, Any] | None:
-    if evaluation is None:
-        return None
-    return (((evaluation.get("metrics") or {}).get(aggregation) or {}).get(metric))
-
-
-def _protocol_summary(
-    generalization_evaluation: dict[str, Any],
-    random_evaluation: dict[str, Any] | None,
-    metrics: tuple[str, ...],
-) -> dict[str, dict[str, float | None]]:
-    summary: dict[str, dict[str, float | None]] = {}
-    for metric in metrics:
-        generalization = _metric_report(generalization_evaluation, "per_metric_absolute", metric)
-        random = _metric_report(random_evaluation, "roi_weighted", metric)
-        if generalization is None:
-            raise ValueError(f"configuration-generalization evaluation lacks metric: {metric}")
-        generalization_value = float(generalization["smape_pct"])
-        random_value = None if random is None else float(random["smape_pct"])
-        summary[metric] = {
-            "config_generalization_smape_pct": generalization_value,
-            "random_roi_smape_pct": random_value,
-            "gap_smape_pct": None if random_value is None else generalization_value - random_value,
-            "config_generalization_wape_pct": float(generalization["wape_pct"]),
-            "random_roi_wape_pct": None if random is None else float(random["wape_pct"]),
-        }
-    return summary
-
-
-def _workload_summary(frame: pd.DataFrame, metrics: tuple[str, ...]) -> dict[str, dict[str, dict[str, float | int | None]]]:
-    report: dict[str, dict[str, dict[str, float | int | None]]] = {}
-    for metric in metrics:
-        metric_report = {}
-        for workload, group in frame.groupby("workload_id", sort=True):
-            truth = group[f"truth_{metric}"].to_numpy(dtype=np.float64)
-            prediction = group[f"prediction_{metric}"].to_numpy(dtype=np.float64)
-            metric_report[str(workload)] = _error_summary(truth, prediction)
-        report[metric] = metric_report
-    return report
-
-
-def _grid(metrics: tuple[str, ...], *, width: float = 4.8, height: float = 3.4) -> tuple[plt.Figure, np.ndarray]:
-    columns = min(3, len(metrics))
-    rows = int(np.ceil(len(metrics) / columns))
-    figure, axes = plt.subplots(rows, columns, figsize=(width * columns, height * rows))
-    return figure, np.atleast_1d(axes).reshape(rows, columns)
-
-
-def _hide_unused_axes(axes: np.ndarray, used: int) -> None:
-    for axis in axes.ravel()[used:]:
-        axis.set_visible(False)
-
-
-def _plot_label_distributions(frame: pd.DataFrame, metrics: tuple[str, ...], path: Path) -> None:
-    figure, axes = _grid(metrics)
-    for axis, metric in zip(axes.ravel(), metrics, strict=False):
-        values = frame[f"label_{metric}"].to_numpy(dtype=np.float64)
-        stats = _distribution(values)
-        axis.hist(values, bins=36, color="#4C78A8", alpha=0.85)
-        axis.axvline(stats["p50"], color="#222222", linestyle="-", linewidth=1.0, label="p50")
-        axis.axvline(stats["p90"], color="#E45756", linestyle="--", linewidth=1.0, label="p90")
-        axis.set_title(metric)
-        axis.set_xlabel("Label value")
-        axis.set_ylabel("Rows")
-        axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-    _hide_unused_axes(axes, len(metrics))
-    handles, labels = axes.ravel()[0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="upper center", ncol=2)
-    figure.tight_layout(rect=(0, 0, 1, 0.94))
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-
-
-def _plot_protocol_errors(
-    generalization_evaluation: dict[str, Any],
-    random_evaluation: dict[str, Any] | None,
-    metrics: tuple[str, ...],
-    path: Path,
-) -> None:
-    x = np.arange(len(metrics))
-    width = 0.34 if random_evaluation else 0.5
-    generalization = [float(_metric_report(generalization_evaluation, "per_metric_absolute", metric)["smape_pct"]) for metric in metrics]
-    random = [
-        None if random_evaluation is None else float(_metric_report(random_evaluation, "roi_weighted", metric)["smape_pct"])
-        for metric in metrics
+    figure, axis = plt.subplots(figsize=(12.4, max(4.5, len(family_order) * 0.48 + 2.0)))
+    colors = plt.get_cmap("tab10")
+    variant_markers = ("o", "s", "^", "D", "P", "X")
+    offsets = np.linspace(-0.18, 0.18, num=len(variants))
+    for index, family in enumerate(family_order):
+        family_rows = summary[summary["workload_family"] == family]
+        for variant_index, variant in enumerate(variants):
+            rows = family_rows[family_rows["variant"] == variant].set_index("config_id")
+            present = [config for config in configs if config in rows.index]
+            x = [float(rows.loc[config, "smape_pct"]) for config in present]
+            y = index + offsets[variant_index]
+            axis.plot(x, [y] * len(x), color="#9A9A9A", linewidth=0.8, zorder=1)
+            for config, value in zip(present, x, strict=True):
+                axis.scatter(
+                    value,
+                    y,
+                    color=colors(configs.index(config)),
+                    marker=variant_markers[variant_index],
+                    s=34,
+                    zorder=2,
+                )
+    config_handles = [
+        Line2D([], [], color=colors(index), marker="o", linestyle="None", label=config_labels[config])
+        for index, config in enumerate(configs)
     ]
-    figure, axis = plt.subplots(figsize=(max(9, len(metrics) * 1.8), 5.2))
-    axis.bar(x - (width / 2 if random_evaluation else 0), generalization, width, label="held-out configuration", color="#4C78A8")
-    if random_evaluation:
-        axis.bar(x + width / 2, random, width, label="random-ROI test", color="#F58518")
-        for idx, (generalization_value, random_value) in enumerate(zip(generalization, random, strict=True)):
-            axis.plot([idx - width / 2, idx + width / 2], [generalization_value, random_value], color="#666666", linewidth=0.9, alpha=0.5)
-    axis.set_xticks(x)
-    axis.set_xticklabels(metrics, rotation=25, ha="right")
-    axis.set_ylabel("SMAPE%")
-    axis.set_title("Surrogate Generalization Error by Protocol")
-    axis.grid(True, axis="y", linestyle="--", alpha=0.35)
-    axis.legend()
-    figure.tight_layout()
+    variant_handles = [
+        Line2D([], [], color="#555555", marker=variant_markers[index], linestyle="None", label=variant)
+        for index, variant in enumerate(variants)
+    ]
+
+    axis.set_yticks(range(len(family_order)))
+    axis.set_yticklabels([f"{_display_family(family)} (n={samples[family]})" for family in family_order], fontsize=8)
+    axis.invert_yaxis()
+    axis.set_xlabel("Mean SMAPE%")
+    axis.set_title(f"{metric}: microbench family error by configuration and variant\n{aggregation_label}", fontsize=10)
+    axis.grid(True, axis="x", linestyle="--", alpha=0.35)
+    configuration_legend = axis.legend(handles=config_handles, title="Configuration", loc="lower right")
+    axis.add_artist(configuration_legend)
+    axis.legend(handles=variant_handles, title="Variant", loc="upper right")
+    figure.text(
+        0.01,
+        0.01,
+        " | ".join(f"{label}={config}" for config, label in config_labels.items()),
+        ha="left",
+        va="bottom",
+        fontsize=7,
+    )
+    figure.tight_layout(rect=(0, 0.035, 1, 1))
     figure.savefig(path, dpi=150)
     plt.close(figure)
+    return path
 
 
-def _plot_workload_error_points(frame: pd.DataFrame, metrics: tuple[str, ...], path: Path) -> None:
-    figure, axes = _grid(metrics, width=5.2, height=3.8)
-    rng = np.random.default_rng(12345)
-    for axis, metric in zip(axes.ravel(), metrics, strict=False):
-        rows = []
-        for workload, group in frame.groupby("workload_id", sort=True):
-            truth = group[f"truth_{metric}"].to_numpy(dtype=np.float64)
-            prediction = group[f"prediction_{metric}"].to_numpy(dtype=np.float64)
-            values = _smape_percent(truth, prediction)
-            rows.append((str(workload), values, float(np.median(values)), float(np.mean(values))))
-        rows.sort(key=lambda item: item[2], reverse=True)
-        labels = [item[0] for item in rows]
-        for index, (_workload, values, median, mean) in enumerate(rows):
-            jitter = rng.uniform(-0.18, 0.18, size=len(values))
-            axis.scatter(np.full(len(values), index) + jitter, values, s=10, alpha=0.35, color="#4C78A8")
-            axis.scatter(index, median, s=35, color="#E45756", marker="D", zorder=3)
-            axis.scatter(index, mean, s=35, color="#222222", marker="_", zorder=3)
-        axis.set_title(metric)
-        axis.set_ylabel("Sample SMAPE%")
-        axis.set_xticks(np.arange(len(labels)))
-        axis.set_xticklabels(labels, rotation=70, ha="right", fontsize=7)
-        axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-    _hide_unused_axes(axes, len(metrics))
-    figure.tight_layout()
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
+def _safe_name(metric: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", metric).strip("_").lower()
+
+
+def _family_variant(workload_id: object) -> tuple[str, str]:
+    family, separator, variant = str(workload_id).rpartition("__")
+    if not separator or not family or not variant:
+        raise ValueError(f"workload_id must end with a variant: {workload_id!r}")
+    return family, variant
+
+
+def _ordered_variants(values: np.ndarray) -> tuple[str, ...]:
+    preferred = ("base", "small", "large")
+    present = set(values)
+    return tuple(variant for variant in preferred if variant in present) + tuple(sorted(present - set(preferred)))
+
+
+def _display_family(family: str) -> str:
+    return family.removeprefix("microbench_")
