@@ -65,10 +65,14 @@ def surrogate_task(config: PeregrineConfig) -> SurrogateTask:
 
 def cross_domain_task(metrics: object, config: PeregrineConfig) -> SurrogateTask:
     proxy_ids = tuple(getattr(metrics, "proxy_ids"))
+    source_feature_ids = tuple(getattr(metrics, "source_feature_ids", ()))
     return SurrogateTask(
         identity_columns=("workload_id", "interval_index"),
         group_column="workload_id",
-        feature_columns=tuple(f"source__{proxy_id}" for proxy_id in proxy_ids),
+        feature_columns=(
+            *(f"source__{proxy_id}" for proxy_id in proxy_ids),
+            *(f"source_extra__{feature_id}" for feature_id in source_feature_ids),
+        ),
         targets=tuple(
             TargetSpec(proxy_id, f"target__{proxy_id}", metrics.proxies[proxy_id].head, "mae")
             for proxy_id in proxy_ids
