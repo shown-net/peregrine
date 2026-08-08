@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import prod
 from typing import Sequence
 
 from anamol.python.design_space import PeregrineConfig
@@ -20,16 +19,12 @@ class TargetSpec:
 
 
 @dataclass(frozen=True)
-class StatsFeatureObject:
-    name: str
-    kind: str
-    shape: tuple[int, ...]
-    fields: tuple[tuple[str, ...], ...]
+class ScalarChannel:
+    source_id: int
+    position_id: int
+    source: str
+    subname: str | None
     unit: str
-
-    @property
-    def value_count(self) -> int:
-        return prod(self.shape) if self.shape else 1
 
 
 @dataclass(frozen=True)
@@ -48,7 +43,8 @@ class SurrogateTask:
     seed: int
     evaluation_folds: int
     validation_fraction: float
-    object_schema: tuple[StatsFeatureObject, ...] = ()
+    channel_schema: tuple[ScalarChannel, ...] = ()
+    active_channel_indices: tuple[int, ...] = ()
     ple_bins: int = 0
     dropout: float = 0.0
     checkpoint_name: str = "surrogate.ckpt"
@@ -74,23 +70,23 @@ def surrogate_task(config: PeregrineConfig) -> SurrogateTask:
     )
 
 
-def cross_domain_task(metrics: object, config: PeregrineConfig, *, object_schema: Sequence[object]) -> SurrogateTask:
-    objects = tuple(StatsFeatureObject(str(item.name), str(item.kind), tuple(item.shape), tuple(tuple(axis) for axis in item.fields), str(item.unit)) for item in object_schema)
-    if not objects:
-        raise ValueError("cross-domain task needs a stats feature schema")
+def cross_domain_task(metrics: object, config: PeregrineConfig, *, channel_schema: Sequence[object]) -> SurrogateTask:
+    channels = tuple(ScalarChannel(int(item.source_id), int(item.position_id), str(item.source), item.subname, str(item.unit)) for item in channel_schema)
+    if not channels:
+        raise ValueError("cross-domain task needs a scalar channel schema")
     targets = tuple(
         TargetSpec(item.metric_id, item.metric_id, item.head, "mae")
         for item in (getattr(metrics, "pmu_targets")[metric_id] for metric_id in getattr(metrics, "metric_ids"))
     )
     return SurrogateTask(
         identity_columns=("workload_id", "interval_index"), group_column="workload_id",
-        feature_columns=tuple(item.name for item in objects), targets=targets,
+        feature_columns=("stats_values",), targets=targets,
         hidden_dims=config.cross_domain.hidden_dims, max_epochs=config.training.max_epochs,
         batch_size=config.training.batch_size, learning_rate=config.training.learning_rate,
         weight_decay=config.training.weight_decay, early_stopping_patience=config.training.early_stopping_patience,
         num_threads=config.training.num_threads or 1, seed=config.training.seed,
         evaluation_folds=config.evaluation.config_folds, validation_fraction=config.training.paper_test_fraction,
-        object_schema=objects, ple_bins=config.cross_domain.ple_bins, dropout=config.cross_domain.dropout,
+        channel_schema=channels, ple_bins=config.cross_domain.ple_bins, dropout=config.cross_domain.dropout,
         checkpoint_name="cross_domain.ckpt",
     )
 
