@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import average_precision_score
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
 from torchmetrics import MeanMetric
@@ -20,7 +21,8 @@ from torchmetrics import MeanMetric
 from .dataset_io import read_dataset_shards
 from .error_metrics import compute_regression_metrics
 from .module import SurrogateModule, fit_normalization
-from .tasks import SurrogateTask
+from .model import CONSTANT_ZERO_HEAD, POSITIVE_HEAD, ZERO_INFLATED_HEAD
+from .tasks import SurrogateTask, TargetSpec
 
 
 def evaluate_surrogate(
@@ -33,23 +35,26 @@ def evaluate_surrogate(
     folds = min(task.evaluation_folds, len(unique_groups))
     if folds < 3:
         raise ValueError("surrogate grouped evaluation requires at least three workloads")
-    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
-    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    features = _feature_matrix(task, frame)
+    raw_labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    labels = raw_labels
     prediction = np.empty_like(labels)
     reports: list[dict[str, object]] = []
     splitter = GroupKFold(n_splits=folds, shuffle=True, random_state=task.seed)
     for fold_index, (train_valid, test) in enumerate(splitter.split(features, labels, groups)):
         train, valid = _train_validation_split(task, train_valid, groups)
-        module, _epoch = _fit_partition(
+        module, epoch = _fit_partition(
             task, features[train], labels[train], features[valid], labels[valid],
             Path(output_dir) / ".folds" / str(fold_index),
         )
-        prediction[test] = _predict_array(module, features[test], task.batch_size)
+        prediction[test] = _predict_array(module, features[test], task.batch_size, task.feature_columns)
         reports.append({
             "heldout_groups": sorted(set(groups[test])),
             "train_rows": int(len(train)), "validation_rows": int(len(valid)), "test_rows": int(len(test)),
+            "epochs": epoch,
+            "model_parameters": sum(parameter.numel() for parameter in module.parameters()),
         })
-    return _publish_evaluation(task, frame, labels, prediction, reports, output_dir)
+    return _publish_evaluation(task, frame, raw_labels, prediction, reports, output_dir)
 
 
 def evaluate_random_pair_surrogate(
@@ -58,16 +63,17 @@ def evaluate_random_pair_surrogate(
 ) -> dict[str, str]:
     """Evaluate in-distribution random ROI/configuration pairs with a fixed split."""
     frame = _read_frame(task, dataset_dir, workload_ids)
-    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
-    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    features = _feature_matrix(task, frame)
+    raw_labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    labels = raw_labels
     train, valid, test = _random_pair_split(len(frame), task.seed)
     module, epochs = _fit_partition(
         task, features[train], labels[train], features[valid], labels[valid],
         Path(output_dir) / ".selection",
     )
-    prediction = _predict_array(module, features[test], task.batch_size)
+    prediction = _predict_array(module, features[test], task.batch_size, task.feature_columns)
     return _publish_random_pair_evaluation(
-        task, frame.iloc[test].copy(), labels[test], prediction, output_dir,
+        task, frame.iloc[test].copy(), raw_labels[test], prediction, output_dir,
         train_rows=len(train), validation_rows=len(valid), epochs=epochs,
     )
 
@@ -77,8 +83,9 @@ def train_surrogate(
     workload_ids: tuple[str, ...] | None = None,
 ) -> dict[str, str]:
     frame = _read_frame(task, dataset_dir, workload_ids)
-    features = frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
-    labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    features = _feature_matrix(task, frame)
+    raw_labels = frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)
+    labels = raw_labels
     groups = frame[task.group_column].astype(str).to_numpy()
     train, valid = _train_validation_split(task, np.arange(len(frame)), groups)
     selection_root = Path(output_dir) / ".selection"
@@ -87,7 +94,11 @@ def train_surrogate(
     )
     shutil.rmtree(selection_root, ignore_errors=True)
     L.seed_everything(task.seed, workers=True)
-    normalization = fit_normalization(features, labels, task.targets)
+    task, features, _ = _fit_task(task, features, labels, features)
+    normalization = fit_normalization(
+        features, labels, task.targets, ple_bins=task.ple_bins,
+        object_feature_width=sum(item.value_count for item in task.object_schema) if task.object_schema else None,
+    )
     module = _module(task, normalization)
     trainer = _trainer(task, max_epochs=epochs, callbacks=[])
     trainer.fit(module, train_dataloaders=_loader(features, labels, task.batch_size, shuffle=True))
@@ -140,19 +151,23 @@ def _fit_partition(
     valid_y: np.ndarray, root: Path,
 ) -> tuple[SurrogateModule, int]:
     L.seed_everything(task.seed, workers=True)
-    normalization = fit_normalization(train_x, train_y, task.targets)
-    module = _module(task, normalization)
+    fitted_task, train_x, valid_x = _fit_task(task, train_x, train_y, valid_x)
+    normalization = fit_normalization(
+        train_x, train_y, fitted_task.targets, ple_bins=fitted_task.ple_bins,
+        object_feature_width=sum(item.value_count for item in fitted_task.object_schema) if fitted_task.object_schema else None,
+    )
+    module = _module(fitted_task, normalization)
     root.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(
         dirpath=root, filename="best", monitor="val/loss", mode="min", save_top_k=1,
         auto_insert_metric_name=False,
     )
     stopping = EarlyStopping(monitor="val/loss", mode="min", patience=task.early_stopping_patience)
-    trainer = _trainer(task, max_epochs=task.max_epochs, callbacks=[checkpoint, stopping])
+    trainer = _trainer(fitted_task, max_epochs=fitted_task.max_epochs, callbacks=[checkpoint, stopping])
     trainer.fit(
         module,
-        train_dataloaders=_loader(train_x, train_y, task.batch_size, shuffle=True),
-        val_dataloaders=_loader(valid_x, valid_y, task.batch_size, shuffle=False),
+        train_dataloaders=_loader(train_x, train_y, fitted_task.batch_size, shuffle=True),
+        val_dataloaders=_loader(valid_x, valid_y, fitted_task.batch_size, shuffle=False),
     )
     if not checkpoint.best_model_path:
         raise RuntimeError("surrogate training produced no checkpoint")
@@ -164,8 +179,32 @@ def _module(task: SurrogateTask, normalization: dict[str, np.ndarray]) -> Surrog
     return SurrogateModule(
         feature_columns=task.feature_columns, targets=task.targets, hidden_dims=task.hidden_dims,
         learning_rate=task.learning_rate, weight_decay=task.weight_decay,
+        object_schema=task.object_schema, ple_bins=task.ple_bins, dropout=task.dropout,
         **normalization,
     )
+
+
+def _fit_task(task: SurrogateTask, train_x: np.ndarray, train_y: np.ndarray,
+              valid_x: np.ndarray) -> tuple[SurrogateTask, np.ndarray, np.ndarray]:
+    targets = tuple(TargetSpec(
+        spec.metric,
+        spec.label_column,
+        spec.head_kind or (
+            CONSTANT_ZERO_HEAD if np.all(train_y[:, index] == 0.0)
+            else ZERO_INFLATED_HEAD if np.any(train_y[:, index] == 0.0)
+            else POSITIVE_HEAD
+        ),
+        spec.primary_metric,
+    ) for index, spec in enumerate(task.targets))
+    if task.object_schema:
+        from dataclasses import replace
+        return replace(task, targets=targets), train_x, valid_x
+    selected = np.flatnonzero(np.std(train_x, axis=0) > 0.0)
+    if not len(selected):
+        raise ValueError("training fold has no varying raw statistics")
+    columns = tuple(task.feature_columns[index] for index in selected)
+    from dataclasses import replace
+    return replace(task, feature_columns=columns, targets=targets), train_x[:, selected], valid_x[:, selected]
 
 
 def _trainer(task: SurrogateTask, *, max_epochs: int, callbacks: list[object]) -> L.Trainer:
@@ -185,7 +224,11 @@ def _loader(features: np.ndarray, labels: np.ndarray, batch_size: int, *, shuffl
     )
 
 
-def _predict_array(module: SurrogateModule, features: np.ndarray, batch_size: int) -> np.ndarray:
+def _predict_array(module: SurrogateModule, features: np.ndarray, batch_size: int,
+                   source_columns: tuple[str, ...] | None = None) -> np.ndarray:
+    if source_columns is not None and not module.object_schema:
+        indices = tuple(source_columns.index(column) for column in module.feature_columns)
+        features = features[:, indices]
     module.eval()
     values: list[np.ndarray] = []
     with torch.inference_mode():
@@ -227,10 +270,29 @@ def _read_frame(task: SurrogateTask, dataset_dir: str | Path, workload_ids: tupl
     required = set(columns)
     if frame.empty or not required <= set(frame) or frame.duplicated(list(task.identity_columns)).any():
         raise ValueError("surrogate dataset has invalid identities or columns")
-    numeric = frame.loc[:, [*task.feature_columns, *task.label_columns]].to_numpy(dtype=np.float64)
+    numeric = np.concatenate((_feature_matrix(task, frame), frame.loc[:, task.label_columns].to_numpy(dtype=np.float32)), axis=1)
     if not np.isfinite(numeric).all():
         raise ValueError("surrogate dataset contains non-finite values")
     return frame
+
+
+def _feature_matrix(task: SurrogateTask, frame: pd.DataFrame) -> np.ndarray:
+    if not task.object_schema:
+        return frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
+    columns: list[np.ndarray] = []
+    for spec in task.object_schema:
+        values = frame[spec.name]
+        if spec.shape:
+            matrix = np.asarray(values.tolist(), dtype=np.float32)
+            if matrix.shape != (len(frame), spec.value_count):
+                raise ValueError(f"raw-stat object column has incompatible list width: {spec.name}")
+        else:
+            matrix = values.to_numpy(dtype=np.float32).reshape(-1, 1)
+        columns.append(matrix)
+    output = np.concatenate(columns, axis=1)
+    if not np.isfinite(output).all() or (output < 0.0).any():
+        raise ValueError("surrogate raw-stat object values must be finite and nonnegative")
+    return output
 
 
 def _read_oof(task: SurrogateTask, path: str | Path) -> pd.DataFrame:
@@ -268,6 +330,8 @@ def _publish_evaluation(
     payload = {
         "protocol": "grouped_workload_kfold",
         "metrics": _metric_report(task, frame, labels, prediction),
+        "target_support": _target_support(task, labels, prediction),
+        "model_parameters": int(max(int(fold["model_parameters"]) for fold in folds)),
         "outer_folds": folds, "samples": int(len(frame)), "groups": int(frame[task.group_column].nunique()),
     }
     report = partial / "evaluation.json"
@@ -296,6 +360,7 @@ def _publish_random_pair_evaluation(
         "protocol": "random_pair_split",
         "generalization_scope": "in_distribution_random_pair",
         "metrics": _metric_report(task, frame, labels, prediction),
+        "target_support": _target_support(task, labels, prediction),
         "samples": train_rows + validation_rows + len(frame),
         "split": {
             "seed": task.seed,
@@ -337,6 +402,34 @@ def _metrics(task: SurrogateTask, truth: np.ndarray, prediction: np.ndarray) -> 
             torch.from_numpy(prediction[:, index].copy()),
             torch.from_numpy(truth[:, index].copy()),
         )
+    return report
+
+
+def _target_support(
+    task: SurrogateTask, truth: np.ndarray, prediction: np.ndarray,
+) -> dict[str, dict[str, float | str]]:
+    report: dict[str, dict[str, float | str]] = {}
+    for index, spec in enumerate(task.targets):
+        actual = truth[:, index].astype(np.float64, copy=False)
+        estimated = prediction[:, index].astype(np.float64, copy=False)
+        positive = actual > 0.0
+        prevalence = float(np.mean(positive))
+        values: dict[str, float | str] = {"nonzero_rate": prevalence}
+        if not positive.any():
+            values["support_kind"] = CONSTANT_ZERO_HEAD
+            values["false_positive_rate"] = float(np.mean(estimated > 0.0))
+        elif positive.all():
+            values["support_kind"] = POSITIVE_HEAD
+        else:
+            values["support_kind"] = ZERO_INFLATED_HEAD
+            values["nonzero_average_precision"] = float(
+                average_precision_score(positive.astype(np.int8), estimated)
+            )
+            values["positive_wmape_pct"] = float(
+                100.0 * np.sum(np.abs(estimated[positive] - actual[positive]))
+                / np.sum(np.abs(actual[positive]))
+            )
+        report[spec.metric] = values
     return report
 
 

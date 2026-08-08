@@ -21,3 +21,8 @@ training:
 
 evaluation:
   config_folds: 5
+
+cross_domain:
+  ple_bins: 8
+  hidden_dims: [128, 64]
+  dropout: 0.1

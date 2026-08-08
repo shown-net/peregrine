@@ -39,6 +39,13 @@ class EvaluationConfig:
 
 
 @dataclass(frozen=True)
+class CrossDomainModelConfig:
+    ple_bins: int
+    hidden_dims: tuple[int, int]
+    dropout: float
+
+
+@dataclass(frozen=True)
 class CollectionSamplingConfig:
     seed: int
     configs_per_region: int
@@ -52,6 +59,7 @@ class PeregrineConfig:
     labels: TraceLabelRegistry
     training: TrainingConfig
     evaluation: EvaluationConfig
+    cross_domain: CrossDomainModelConfig
 
     @property
     def design_parameter_names(self) -> tuple[str, ...]:
@@ -115,6 +123,9 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
     evaluation = payload.get("evaluation")
     if not isinstance(evaluation, dict):
         raise ValueError("Peregrine config must define evaluation")
+    cross_domain = payload.get("cross_domain")
+    if not isinstance(cross_domain, dict):
+        raise ValueError("Peregrine config must define cross_domain")
     hidden_dims = tuple(int(value) for value in training["hidden_dims"])
     if len(hidden_dims) != 2:
         raise ValueError("training.hidden_dims must contain two values")
@@ -144,6 +155,11 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
         ),
         evaluation=EvaluationConfig(
             config_folds=int(evaluation["config_folds"]),
+        ),
+        cross_domain=CrossDomainModelConfig(
+            ple_bins=int(cross_domain["ple_bins"]),
+            hidden_dims=tuple(int(value) for value in cross_domain["hidden_dims"]),
+            dropout=float(cross_domain["dropout"]),
         ),
     )
     _validate_config(config)
@@ -175,6 +191,8 @@ def _validate_config(config: PeregrineConfig) -> None:
         raise ValueError("training.weight_decay must not be negative")
     if config.evaluation.config_folds < 3:
         raise ValueError("evaluation.config_folds must be at least three")
+    if config.cross_domain.ple_bins < 1 or len(config.cross_domain.hidden_dims) != 2 or min(config.cross_domain.hidden_dims) < 1 or not 0.0 <= config.cross_domain.dropout < 1.0:
+        raise ValueError("cross_domain model configuration is invalid")
     for name, value in (("paper_test_fraction", config.training.paper_test_fraction),):
         if not 0.0 < value < 1.0:
             raise ValueError(f"training.{name} must be between zero and one")
