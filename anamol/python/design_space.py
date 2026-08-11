@@ -40,7 +40,6 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class CrossDomainModelConfig:
-    ple_bins: int
     hidden_dims: tuple[int, int]
     dropout: float
 
@@ -157,7 +156,6 @@ def load_peregrine_config(path: str | Path, *, metrics_config: str | Path, micro
             config_folds=int(evaluation["config_folds"]),
         ),
         cross_domain=CrossDomainModelConfig(
-            ple_bins=int(cross_domain["ple_bins"]),
             hidden_dims=tuple(int(value) for value in cross_domain["hidden_dims"]),
             dropout=float(cross_domain["dropout"]),
         ),
@@ -191,7 +189,11 @@ def _validate_config(config: PeregrineConfig) -> None:
         raise ValueError("training.weight_decay must not be negative")
     if config.evaluation.config_folds < 3:
         raise ValueError("evaluation.config_folds must be at least three")
-    if config.cross_domain.ple_bins < 1 or len(config.cross_domain.hidden_dims) != 2 or min(config.cross_domain.hidden_dims) < 1 or not 0.0 <= config.cross_domain.dropout < 1.0:
+    if (
+        len(config.cross_domain.hidden_dims) != 2
+        or min(config.cross_domain.hidden_dims) < 1
+        or not 0.0 <= config.cross_domain.dropout < 1.0
+    ):
         raise ValueError("cross_domain model configuration is invalid")
     for name, value in (("paper_test_fraction", config.training.paper_test_fraction),):
         if not 0.0 < value < 1.0:

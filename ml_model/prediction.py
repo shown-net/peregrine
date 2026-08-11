@@ -95,10 +95,7 @@ def train_surrogate(
     shutil.rmtree(selection_root, ignore_errors=True)
     L.seed_everything(task.seed, workers=True)
     task, features, _ = _fit_task(task, features, labels, features)
-    normalization = fit_normalization(
-        features, labels, task.targets, ple_bins=task.ple_bins,
-        channel_width=len(task.active_channel_indices) if task.channel_schema else None,
-    )
+    normalization = fit_normalization(features, labels, task.targets)
     module = _module(task, normalization)
     trainer = _trainer(task, max_epochs=epochs, callbacks=[])
     trainer.fit(module, train_dataloaders=_loader(features, labels, task.batch_size, shuffle=True))
@@ -152,10 +149,7 @@ def _fit_partition(
 ) -> tuple[SurrogateModule, int]:
     L.seed_everything(task.seed, workers=True)
     fitted_task, train_x, valid_x = _fit_task(task, train_x, train_y, valid_x)
-    normalization = fit_normalization(
-        train_x, train_y, fitted_task.targets, ple_bins=fitted_task.ple_bins,
-        channel_width=len(fitted_task.active_channel_indices) if fitted_task.channel_schema else None,
-    )
+    normalization = fit_normalization(train_x, train_y, fitted_task.targets)
     module = _module(fitted_task, normalization)
     root.mkdir(parents=True, exist_ok=True)
     checkpoint = ModelCheckpoint(
@@ -179,8 +173,7 @@ def _module(task: SurrogateTask, normalization: dict[str, np.ndarray]) -> Surrog
     return SurrogateModule(
         feature_columns=task.feature_columns, targets=task.targets, hidden_dims=task.hidden_dims,
         learning_rate=task.learning_rate, weight_decay=task.weight_decay,
-        channel_schema=task.channel_schema, active_channel_indices=task.active_channel_indices,
-        ple_bins=task.ple_bins, dropout=task.dropout,
+        dropout=task.dropout,
         **normalization,
     )
 
@@ -197,12 +190,6 @@ def _fit_task(task: SurrogateTask, train_x: np.ndarray, train_y: np.ndarray,
         ),
         spec.primary_metric,
     ) for index, spec in enumerate(task.targets))
-    if task.channel_schema:
-        selected = np.flatnonzero(np.ptp(train_x, axis=0) > 0.0)
-        if not len(selected):
-            raise ValueError("training fold has no varying scalar channels")
-        from dataclasses import replace
-        return replace(task, targets=targets, active_channel_indices=tuple(int(index) for index in selected)), train_x[:, selected], valid_x[:, selected]
     selected = np.flatnonzero(np.std(train_x, axis=0) > 0.0)
     if not len(selected):
         raise ValueError("training fold has no varying raw statistics")
@@ -230,14 +217,9 @@ def _loader(features: np.ndarray, labels: np.ndarray, batch_size: int, *, shuffl
 
 def _predict_array(module: SurrogateModule, features: np.ndarray, batch_size: int,
                    source_columns: tuple[str, ...] | None = None) -> np.ndarray:
-    if source_columns is not None and not module.channel_schema:
+    if source_columns is not None:
         indices = tuple(source_columns.index(column) for column in module.feature_columns)
         features = features[:, indices]
-    elif getattr(module, "channel_schema", ()):
-        if features.shape[1] == len(module.channel_schema):
-            features = features[:, module.active_channel_indices]
-        elif features.shape[1] != len(module.active_channel_indices):
-            raise ValueError("scalar channel prediction matrix has incompatible width")
     module.eval()
     values: list[np.ndarray] = []
     with torch.inference_mode():
@@ -286,14 +268,7 @@ def _read_frame(task: SurrogateTask, dataset_dir: str | Path, workload_ids: tupl
 
 
 def _feature_matrix(task: SurrogateTask, frame: pd.DataFrame) -> np.ndarray:
-    if not task.channel_schema:
-        return frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
-    output = np.asarray(frame["stats_values"].tolist(), dtype=np.float32)
-    if output.shape != (len(frame), len(task.channel_schema)):
-        raise ValueError("cross-domain scalar channel matrix has incompatible width")
-    if not np.isfinite(output).all() or (output < 0.0).any():
-        raise ValueError("surrogate raw-stat object values must be finite and nonnegative")
-    return output
+    return frame.loc[:, task.feature_columns].to_numpy(dtype=np.float32)
 
 
 def _read_oof(task: SurrogateTask, path: str | Path) -> pd.DataFrame:

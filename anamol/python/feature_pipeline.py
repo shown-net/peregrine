@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pathlib import Path
 
 import numpy as np
@@ -25,15 +27,6 @@ def analytical_feature_columns(mechanisms: tuple[ComponentDef, ...]) -> tuple[st
         for mechanism in mechanisms
         for column in distribution_feature_columns(f"dynamic_{mechanism.name}")
     )
-
-
-def trace_section_counts(
-    trace_path: str | Path,
-) -> tuple[int, ...]:
-    trace = Path(trace_path).resolve()
-    if trace.suffixes[-2:] != [".pb", ".zst"]:
-        raise ValueError(f"Anamol requires a protobuf trace: {trace}")
-    return (int(_analysis_module().trace_instruction_count(str(trace))),)
 
 
 def analyze_full_roi_windows(

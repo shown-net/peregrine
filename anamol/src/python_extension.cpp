@@ -42,33 +42,17 @@ std::vector<analytical::MechanismBinding> parse_mechanisms(
     analytical::MechanismBinding binding;
     binding.name = py::cast<std::string>(dict["name"]);
     binding.model = py::cast<std::string>(dict["model"]);
-    for (const auto& param : py::reinterpret_borrow<py::tuple>(dict["params"]))
+    for (const auto& param : py::reinterpret_borrow<py::iterable>(dict["params"]))
       binding.params.push_back(py::cast<std::string>(param));
     out.push_back(std::move(binding));
   }
   return out;
 }
 
-std::vector<analytical::Instr> parse_single_region(const std::string& path) {
-  std::vector<analytical::Instr> region;
-  analytical::stream_proto_region(
-      path,
-      [&](std::vector<analytical::Instr>&& parsed) {
-        if (!region.empty())
-          throw std::runtime_error("Anamol trace file must contain one region");
-        region = std::move(parsed);
-      });
-  return region;
-}
-
 }  // namespace
 
 PYBIND11_MODULE(_analysis, module) {
   module.doc() = "In-process Anamol analytical engine";
-
-  module.def("trace_instruction_count", [](const std::string& trace_path) {
-    return parse_single_region(trace_path).size();
-  });
 
   module.def("feature_count_for_bindings", [](const py::list& mechanisms) {
     auto bindings = parse_mechanisms(mechanisms);
@@ -80,16 +64,14 @@ PYBIND11_MODULE(_analysis, module) {
       [](const std::string& trace_path, int full_roi_window_size,
          int analysis_window_size, size_t window_count, const py::list& configs,
          const py::list& mechanisms, int config_threads) {
+        (void)config_threads;
         auto rows = parse_configs(configs);
         auto bindings = parse_mechanisms(mechanisms);
-        std::vector<analytical::Instr> parsed;
         std::vector<double> flat;
         {
           py::gil_scoped_release release;
-          parsed = parse_single_region(trace_path);
-          flat = analytical::analyze_trace_windows(
-              parsed, full_roi_window_size, analysis_window_size, window_count, rows,
-              bindings, config_threads);
+          flat = analytical::analyze_trace_file_windows(
+              trace_path, full_roi_window_size, analysis_window_size, window_count, rows, bindings);
         }
         const size_t column_count = analytical::feature_count(bindings);
         const size_t config_count = rows.size();

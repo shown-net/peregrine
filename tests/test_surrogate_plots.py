@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ml_model.plots import plot_cross_domain_model_comparison
 from ml_model.plots import plot_surrogate_generalization_errors
 
 
@@ -98,3 +99,146 @@ def test_generalization_error_plots_reject_invalid_workload_ood_artifacts(
             random_pair_dir=random_pair,
             output_dir=tmp_path / "plots",
         )
+
+
+def _cross_domain_predictions() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "workload_id": ["alpha", "alpha", "beta", "beta"],
+            "interval_index": [0, 1, 0, 1],
+            "truth_CPI": [1.0, 2.0, 3.0, 4.0],
+            "anchor_CPI": [1.5, 2.5, 2.5, 50.0],
+            "ridge_CPI": [1.1, 2.1, 3.2, 4.2],
+            "mlp_CPI": [0.9, 2.2, 2.8, 4.1],
+            "selected_CPI": [0.9, 2.2, 2.8, 4.1],
+            "truth_BRANCH_MPKI": [0.0, 0.0, 10.0, 1000.0],
+            "anchor_BRANCH_MPKI": [0.0, 1.0, 12.0, 800.0],
+            "ridge_BRANCH_MPKI": [0.0, 0.5, 9.0, 900.0],
+            "mlp_BRANCH_MPKI": [0.0, 0.2, 11.0, 950.0],
+            "selected_BRANCH_MPKI": [0.0, 0.5, 9.0, 900.0],
+            "truth_L2_REFILL_RATIO": [np.nan, 0.0, 0.5, 1.0],
+            "anchor_L2_REFILL_RATIO": [0.0, 0.0, 0.6, 0.8],
+            "ridge_L2_REFILL_RATIO": [0.0, 0.0, 0.4, 0.9],
+            "mlp_L2_REFILL_RATIO": [0.0, 0.0, 0.5, 1.1],
+            "truth_STALL_CYCLE_RATIO": [0.1, 0.2, 0.3, 0.4],
+        }
+    )
+
+
+def _write_cross_domain_evaluation(root: Path) -> None:
+    root.mkdir()
+    payload = {
+        "protocol": "workload_kfold",
+        "samples": 4,
+        "workloads": 2,
+        "metrics": {
+            "CPI": {
+                "metric_kind": "continuous",
+                "selected_model": "mlp",
+                "truth_degenerate": False,
+                "models": {
+                    "anchor": {"smape_pct": 20.0},
+                    "ridge": {"smape_pct": 5.0},
+                    "mlp": {"smape_pct": 4.0},
+                },
+            },
+            "BRANCH_MPKI": {
+                "metric_kind": "sparse",
+                "selected_model": "ridge",
+                "truth_degenerate": False,
+                "models": {
+                    "anchor": {"average_precision": 0.7, "positive_wape_pct": 30.0},
+                    "ridge": {"average_precision": 0.8, "positive_wape_pct": 20.0},
+                    "mlp": {"average_precision": 0.75, "positive_wape_pct": 25.0},
+                },
+            },
+        },
+        "derived_metrics": {
+            "L2_REFILL_RATIO": {
+                "metric_kind": "sparse",
+                "selected_model": "mlp",
+                "truth_degenerate": False,
+                "models": {
+                    "anchor": {"average_precision": 0.7, "positive_wape_pct": 30.0},
+                    "ridge": {"average_precision": 0.8, "positive_wape_pct": 20.0},
+                    "mlp": {"average_precision": 0.85, "positive_wape_pct": 15.0},
+                },
+            },
+        },
+    }
+    (root / "evaluation.json").write_text(json.dumps(payload), encoding="utf-8")
+    _cross_domain_predictions().to_parquet(root / "oof_predictions.parquet", index=False)
+
+
+def test_cross_domain_model_comparison_plots_metric_pngs_and_manifest(tmp_path: Path) -> None:
+    evaluation = tmp_path / "evaluation"
+    _write_cross_domain_evaluation(evaluation)
+
+    plots = plot_cross_domain_model_comparison(
+        evaluation_dir=evaluation,
+        output_dir=tmp_path / "plots",
+    )
+
+    assert set(plots) == {"BRANCH_MPKI", "CPI", "L2_REFILL_RATIO"}
+    for path in plots.values():
+        image = Path(path)
+        assert image.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    manifest = json.loads((tmp_path / "plots" / "plots.json").read_text(encoding="utf-8"))
+    assert set(manifest) == {"protocol", "plots"}
+    assert manifest["protocol"] == "workload_kfold"
+    assert manifest["plots"] == plots
+
+
+def test_cross_domain_model_comparison_rejects_missing_model_columns(tmp_path: Path) -> None:
+    evaluation = tmp_path / "evaluation"
+    _write_cross_domain_evaluation(evaluation)
+    _cross_domain_predictions().drop(columns="mlp_CPI").to_parquet(
+        evaluation / "oof_predictions.parquet",
+        index=False,
+    )
+
+    with pytest.raises(ValueError, match="required model columns"):
+        plot_cross_domain_model_comparison(
+            evaluation_dir=evaluation,
+            output_dir=tmp_path / "plots",
+        )
+
+
+def test_cross_domain_model_comparison_handles_zero_inflated_long_tail_truth(tmp_path: Path) -> None:
+    evaluation = tmp_path / "evaluation"
+    evaluation.mkdir()
+    rows = 20
+    truth = np.array([0.0] * 8 + [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 10.0, 100.0, 1_000.0, 10_000.0])
+    frame = pd.DataFrame({
+        "workload_id": ["alpha"] * rows,
+        "interval_index": np.arange(rows),
+        "truth_CPI": truth,
+        "anchor_CPI": truth + np.linspace(0.0, 10.0, rows),
+        "ridge_CPI": truth + 1.0,
+        "mlp_CPI": truth,
+    })
+    (evaluation / "evaluation.json").write_text(
+        json.dumps({
+            "protocol": "workload_kfold",
+            "samples": rows,
+            "workloads": 1,
+            "metrics": {
+                "CPI": {
+                    "metric_kind": "continuous",
+                    "selected_model": "mlp",
+                    "truth_degenerate": False,
+                    "models": {
+                        "anchor": {"smape_pct": 10.0},
+                        "ridge": {"smape_pct": 5.0},
+                        "mlp": {"smape_pct": 0.0},
+                    },
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    frame.to_parquet(evaluation / "oof_predictions.parquet", index=False)
+
+    plots = plot_cross_domain_model_comparison(evaluation_dir=evaluation, output_dir=tmp_path / "plots")
+
+    assert Path(plots["CPI"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")

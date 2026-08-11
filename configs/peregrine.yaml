@@ -15,7 +15,7 @@ training:
   paper_test_fraction: 0.25
   seed: 42
   learning_rate: 0.001
-  num_threads: 24
+  num_threads: 1
   weight_decay: 0.0
   early_stopping_patience: 10
 
@@ -23,6 +23,5 @@ evaluation:
   config_folds: 5
 
 cross_domain:
-  ple_bins: 8
   hidden_dims: [128, 64]
   dropout: 0.1

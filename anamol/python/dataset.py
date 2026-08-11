@@ -209,7 +209,11 @@ def load_config_stats_workload(
     samples: list[ConfigStatsSample] = []
     expected_windows: int | None = None
     for config_root in sorted(
-        (path for path in configs_root.iterdir() if path.is_dir()),
+        (
+            path
+            for path in configs_root.iterdir()
+            if path.is_dir() and FINAL_CONFIG_ID.fullmatch(path.name)
+        ),
         key=lambda path: (path.name != reference_id, path.name),
     ):
         stats_path = config_root / "stats.h5"

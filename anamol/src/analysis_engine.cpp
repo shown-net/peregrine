@@ -1,4 +1,5 @@
 #include "analysis_engine.h"
+#include "parser.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -395,6 +396,57 @@ std::vector<double> analyze_trace_windows(const std::vector<Instr>& instrs, int 
     }
   }
   return output;
+}
+
+std::vector<double> analyze_trace_file_windows(
+    const std::string& trace_path, int full_roi_window_size, int analysis_window_size,
+    size_t requested_window_count, const std::vector<ConfigValues>& configs,
+    const std::vector<MechanismBinding>& mechanisms) {
+  if (full_roi_window_size <= 0 || analysis_window_size <= 0 || configs.empty() || mechanisms.empty())
+    throw std::runtime_error("invalid Anamol full-ROI analysis arguments");
+  const size_t full = static_cast<size_t>(full_roi_window_size), analysis = static_cast<size_t>(analysis_window_size);
+  if (full % analysis != 0 || requested_window_count < 2)
+    throw std::runtime_error("Anamol requires complete, evenly divisible full-ROI windows");
+  std::vector<Binding> bindings;
+  bindings.reserve(mechanisms.size());
+  for (const auto& mechanism : mechanisms) bindings.push_back(parse_binding(mechanism));
+  const size_t columns = feature_count(mechanisms);
+  std::vector<ConfigAnalyzer> analyzers;
+  analyzers.reserve(configs.size());
+  for (const auto& config : configs) analyzers.emplace_back(config, bindings);
+  std::vector<std::vector<std::vector<double>>> samples(
+      configs.size(), std::vector<std::vector<double>>(mechanisms.size()));
+  std::vector<std::vector<double>> output(configs.size());
+  for (auto& values : output) values.reserve((requested_window_count - 1) * columns);
+  size_t instruction_count = 0, emitted_windows = 0;
+  stream_proto_instructions(trace_path, [&](Instr&& instruction) {
+    for (size_t config = 0; config < analyzers.size(); ++config) {
+      analyzers[config].process(instruction);
+      if ((instruction_count + 1) % analysis == 0) {
+        const auto snapshot = analyzers[config].snapshot(bindings);
+        for (size_t mechanism = 0; mechanism < mechanisms.size(); ++mechanism)
+          samples[config][mechanism].push_back(snapshot[mechanism]);
+      }
+    }
+    ++instruction_count;
+    if (instruction_count % full != 0) return;
+    const size_t raw_window = instruction_count / full - 1;
+    if (raw_window == 0) return;
+    for (size_t config = 0; config < analyzers.size(); ++config) {
+      for (auto& component : samples[config]) {
+        const auto features = distribution_features(std::move(component));
+        output[config].insert(output[config].end(), features.begin(), features.end());
+      }
+      samples[config].assign(mechanisms.size(), {});
+    }
+    ++emitted_windows;
+  }, requested_window_count * full);
+  if (instruction_count != requested_window_count * full || emitted_windows != requested_window_count - 1)
+    throw std::runtime_error("Anamol trace is shorter than requested complete windows");
+  std::vector<double> flattened;
+  flattened.reserve(configs.size() * (requested_window_count - 1) * columns);
+  for (const auto& values : output) flattened.insert(flattened.end(), values.begin(), values.end());
+  return flattened;
 }
 
 }  // namespace analytical

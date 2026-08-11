@@ -149,35 +149,44 @@ void validate_micro_ops(const ProtoMessage::AnamolTraceChunk& chunk, int records
 
 }  // namespace
 
-void stream_proto_region(
+void stream_proto_chunks(
     const std::string& proto_path,
-    const RegionConsumer& consume) {
+    const ChunkConsumer& consume) {
   ZstdFrameReader reader(proto_path);
-
-  std::vector<Instr> section;
-  instr_id_t previous_micro_id = 0;
-  bool have_micro_id = false;
   ProtoMessage::AnamolTraceChunk chunk;
+  bool observed = false;
   while (reader.readDelimited(chunk)) {
     const int records = chunk.ids_size();
-    if (records <= 0 || chunk.ids_size() != records ||
-        chunk.ips_size() != records || chunk.class_flags_size() != records ||
+    if (records <= 0 || chunk.ips_size() != records ||
+        chunk.class_flags_size() != records ||
         chunk.branch_types_size() != records ||
         chunk.branch_taken_size() != records ||
-        chunk.branch_target_addrs_size() != records ||
-        (chunk.fixed_execution_latencies_size() != 0 &&
-         chunk.fixed_execution_latencies_size() != records) ||
-        chunk.read_sizes_size() != chunk.read_addresses_size() ||
-        chunk.write_sizes_size() != chunk.write_addresses_size())
+        chunk.branch_target_addrs_size() != records)
       throw std::runtime_error("invalid Anamol trace chunk lengths");
     validate_offsets(chunk.dep_offsets(), records, chunk.dep_ids_size());
     validate_offsets(chunk.read_offsets(), records, chunk.read_addresses_size());
     validate_offsets(chunk.write_offsets(), records, chunk.write_addresses_size());
     validate_micro_ops(chunk, records);
+    if (!consume(chunk)) return;
+    observed = true;
+    chunk.Clear();
+  }
+  if (!observed)
+    throw std::runtime_error("Anamol trace contains no instructions");
+}
 
+void stream_proto_instructions(
+    const std::string& proto_path,
+    const InstructionConsumer& consume, size_t maximum_instructions) {
+  size_t instruction_index = 0;
+  instr_id_t previous_micro_id = 0;
+  bool have_micro_id = false;
+  stream_proto_chunks(proto_path, [&](const ProtoMessage::AnamolTraceChunk& chunk) {
+    const int records = chunk.ids_size();
     for (int index = 0; index < records; ++index) {
+      if (instruction_index == maximum_instructions) return false;
       Instr instr{};
-      instr.id = static_cast<instr_id_t>(section.size());
+      instr.id = static_cast<instr_id_t>(instruction_index++);
       instr.IP = chunk.ips(index);
       instr.fetch_latency = 0;
       instr.exe_latency =
@@ -240,12 +249,21 @@ void stream_proto_region(
         previous_micro_id = chunk.micro_op_ids(int(micro));
         have_micro_id = true;
       }
-      section.push_back(std::move(instr));
+      consume(std::move(instr));
     }
-    chunk.Clear();
-  }
-  if (section.empty())
+    return true;
+  });
+  if (instruction_index == 0)
     throw std::runtime_error("Anamol trace contains no instructions");
+}
+
+void stream_proto_region(
+    const std::string& proto_path,
+    const RegionConsumer& consume) {
+  std::vector<Instr> section;
+  stream_proto_instructions(proto_path, [&](Instr&& instruction) {
+    section.push_back(std::move(instruction));
+  });
   consume(std::move(section));
 }
 
