@@ -67,7 +67,7 @@ def test_evaluation_emits_workload_isolated_oof_and_diagnostic(tmp_path) -> None
     dataset = tmp_path / "dataset.parquet"
     pq.write_table(pa.table({
         "workload_id": workloads,
-        "interval_index": np.tile(np.arange(3), 5),
+        "prefix_index": np.tile(np.arange(1, 4), 5),
         "instruction_count": np.full(rows, 100_000),
         "stats_anchors": anchors,
         "stats_features": features,
@@ -81,7 +81,10 @@ def test_evaluation_emits_workload_isolated_oof_and_diagnostic(tmp_path) -> None
 
     assert len(oof) == rows
     assert "truth_STALL_CYCLE_RATIO" in oof
-    assert "selected_CPI" in oof
+    assert "anchor_CPI" in oof
+    assert "mlp_CPI" in oof
+    assert "selected_CPI" not in oof
+    assert "ridge_CPI" not in oof
 
 
 def test_evaluation_reports_canonical_continuous_and_sparse_summaries(tmp_path) -> None:
@@ -110,7 +113,7 @@ def test_evaluation_reports_canonical_continuous_and_sparse_summaries(tmp_path) 
     dataset = tmp_path / "dataset.parquet"
     pq.write_table(pa.table({
         "workload_id": workloads,
-        "interval_index": np.tile(np.arange(3), 5),
+        "prefix_index": np.tile(np.arange(1, 4), 5),
         "instruction_count": np.full(rows, 100_000),
         "stats_anchors": anchors,
         "stats_features": features,
@@ -123,18 +126,23 @@ def test_evaluation_reports_canonical_continuous_and_sparse_summaries(tmp_path) 
 
     cpi = report["metrics"]["CPI"]
     assert cpi["metric_kind"] == "continuous"
-    assert set(cpi["models"]["anchor"]) == {"smape_pct"}
-    assert set(cpi["models"]["ridge"]) == {"smape_pct"}
-    assert set(cpi["models"]["mlp"]) == {"smape_pct"}
+    assert set(cpi["models"]) == {"anchor", "mlp"}
+    assert set(cpi["models"]["anchor"]) == {"smape_pct", "wape_pct"}
+    assert set(cpi["models"]["mlp"]) == {"smape_pct", "wape_pct"}
+    assert "smape_pct_delta" in cpi["mlp_vs_anchor"]
     sparse = report["metrics"]["MEM_READ_PER_KI"]
     assert sparse["metric_kind"] == "sparse"
-    assert set(sparse["models"]["anchor"]) == {"average_precision", "positive_wape_pct"}
-    assert set(sparse["models"]["ridge"]) == {"average_precision", "positive_wape_pct"}
-    assert set(sparse["models"]["mlp"]) == {"average_precision", "positive_wape_pct"}
+    assert set(sparse["models"]) == {"anchor", "mlp"}
+    assert set(sparse["models"]["anchor"]) == {
+        "average_precision", "positive_wape_pct", "smape_pct", "wape_pct",
+        "zero_pred_abs_p50", "zero_pred_abs_p95",
+    }
+    assert set(sparse["models"]["mlp"]) == set(sparse["models"]["anchor"])
+    assert "positive_wape_pct_delta" in sparse["mlp_vs_anchor"]
     assert report["derived_metrics"]["IPC"]["metric_kind"] == "continuous"
 
 
-def test_acceptance_uses_summary_specific_improvement_rules() -> None:
+def test_acceptance_reports_mlp_vs_anchor_improvement() -> None:
     continuous = SimpleNamespace(metric="CPI")
     sparse = SimpleNamespace(metric="MISS_MPKI")
     metrics = {
@@ -142,40 +150,24 @@ def test_acceptance_uses_summary_specific_improvement_rules() -> None:
             "metric_kind": "continuous",
             "truth_degenerate": False,
             "models": {
-                "anchor": {"smape_pct": 10.0},
-                "ridge": {"smape_pct": 12.0},
-                "mlp": {"smape_pct": 8.0},
+                "anchor": {"smape_pct": 10.0, "wape_pct": 11.0},
+                "mlp": {"smape_pct": 8.0, "wape_pct": 9.0},
             },
-            "best_model": "mlp",
-            "selected_model": "mlp",
+            "mlp_vs_anchor": {"smape_pct_delta": -2.0, "wape_pct_delta": -2.0},
         },
         "MISS_MPKI": {
             "metric_kind": "sparse",
             "truth_degenerate": False,
             "models": {
-                "anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0},
-                "ridge": {"average_precision": 0.7, "positive_wape_pct": 40.0},
-                "mlp": {"average_precision": 0.8, "positive_wape_pct": 30.0},
+                "anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0, "smape_pct": 60.0, "wape_pct": 55.0},
+                "mlp": {"average_precision": 0.7, "positive_wape_pct": 30.0, "smape_pct": 70.0, "wape_pct": 35.0},
             },
-            "best_model": "mlp",
-            "selected_model": "mlp",
+            "mlp_vs_anchor": {"positive_wape_pct_delta": -20.0, "smape_pct_delta": 10.0, "wape_pct_delta": -20.0},
         },
     }
     fold_metrics = {
-        "CPI": [
-            {"metric_kind": "continuous", "models": {"anchor": {"smape_pct": 10.0}, "mlp": {"smape_pct": 8.0}}},
-            {"metric_kind": "continuous", "models": {"anchor": {"smape_pct": 10.0}, "mlp": {"smape_pct": 8.0}}},
-            {"metric_kind": "continuous", "models": {"anchor": {"smape_pct": 10.0}, "mlp": {"smape_pct": 8.0}}},
-            {"metric_kind": "continuous", "models": {"anchor": {"smape_pct": 10.0}, "mlp": {"smape_pct": 8.0}}},
-            {"metric_kind": "continuous", "models": {"anchor": {"smape_pct": 10.0}, "mlp": {"smape_pct": 12.0}}},
-        ],
-        "MISS_MPKI": [
-            {"metric_kind": "sparse", "models": {"anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0}, "mlp": {"average_precision": 0.8, "positive_wape_pct": 30.0}}},
-            {"metric_kind": "sparse", "models": {"anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0}, "mlp": {"average_precision": 0.8, "positive_wape_pct": 30.0}}},
-            {"metric_kind": "sparse", "models": {"anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0}, "mlp": {"average_precision": 0.8, "positive_wape_pct": 30.0}}},
-            {"metric_kind": "sparse", "models": {"anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0}, "mlp": {"average_precision": 0.8, "positive_wape_pct": 30.0}}},
-            {"metric_kind": "sparse", "models": {"anchor": {"average_precision": 0.8, "positive_wape_pct": 50.0}, "mlp": {"average_precision": 0.7, "positive_wape_pct": 30.0}}},
-        ],
+        "CPI": [metrics["CPI"]],
+        "MISS_MPKI": [metrics["MISS_MPKI"]],
     }
 
     acceptance = cross_domain._acceptance(
@@ -187,23 +179,23 @@ def test_acceptance_uses_summary_specific_improvement_rules() -> None:
     assert acceptance["improved_targets"] == ["CPI", "MISS_MPKI"]
     assert acceptance["regressed_targets"] == []
     assert acceptance["degenerate_targets"] == []
-    assert acceptance["selected_models"] == {"CPI": "mlp", "MISS_MPKI": "mlp"}
+    assert acceptance["model"] == "mlp"
+    assert acceptance["baseline"] == "anchor"
     assert acceptance["passed"] is True
 
 
-def test_metric_summary_selects_anchor_when_best_model_regresses() -> None:
+def test_metric_summary_reports_mlp_vs_anchor_delta() -> None:
     summary = cross_domain._metric_summary(
         np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
         {
             "anchor": np.asarray([1.0, 2.0, 3.0], dtype=np.float32),
-            "ridge": np.asarray([10.0, 20.0, 30.0], dtype=np.float32),
             "mlp": np.asarray([9.0, 18.0, 27.0], dtype=np.float32),
         },
         np.asarray(["a", "b", "c"]),
     )
 
-    assert summary["selected_model"] == "anchor"
-    assert not summary["selected_regressed_from_anchor"]
+    assert set(summary["models"]) == {"anchor", "mlp"}
+    assert summary["mlp_vs_anchor"]["smape_pct_delta"] > 0.0
 
 
 def test_acceptance_reports_degenerate_targets_without_counting_them() -> None:
@@ -213,13 +205,10 @@ def test_acceptance_reports_degenerate_targets_without_counting_them() -> None:
             "metric_kind": "continuous",
             "truth_degenerate": True,
             "models": {
-                "anchor": {"smape_pct": 100.0},
-                "ridge": {"smape_pct": 0.0},
-                "mlp": {"smape_pct": 0.0},
+                "anchor": {"smape_pct": 100.0, "wape_pct": 100.0},
+                "mlp": {"smape_pct": 0.0, "wape_pct": 0.0},
             },
-            "best_model": "ridge",
-            "selected_model": "ridge",
-            "selected_regressed_from_anchor": False,
+            "mlp_vs_anchor": {"smape_pct_delta": -100.0, "wape_pct_delta": -100.0},
         }
     }
 

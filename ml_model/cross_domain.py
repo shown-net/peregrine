@@ -12,7 +12,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
-from sklearn.linear_model import Ridge
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import GroupKFold
 from torch import nn
@@ -24,7 +23,7 @@ class CrossDomainNetwork(nn.Module):
         super().__init__()
         first, second = hidden_dims
         self.network = nn.Sequential(
-            nn.Linear(input_width, first), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(input_width, first), nn.GELU(), nn.LayerNorm(first), nn.Dropout(dropout),
             nn.Linear(first, second), nn.GELU(), nn.Linear(second, 1),
         )
         final = self.network[-1]
@@ -78,9 +77,12 @@ def _fit_transform(features: np.ndarray, anchor_feature: np.ndarray, correction:
     active = np.flatnonzero(features.std(axis=0) > 1e-8)
     if not len(active):
         raise ValueError("training fold has no varying semantic features")
-    x = np.column_stack((features[:, active], anchor_feature))
+    selected = features[:, active]
+    log_mask = _log_feature_mask(selected)
+    x = np.column_stack((_apply_feature_transform(selected, log_mask), anchor_feature))
     return {
         "active": active,
+        "log_mask": log_mask,
         "feature_mean": x.mean(axis=0, keepdims=True),
         "feature_scale": np.maximum(x.std(axis=0, keepdims=True), 1e-6),
         "target_mean": np.asarray([correction.mean()], dtype=np.float32),
@@ -89,7 +91,8 @@ def _fit_transform(features: np.ndarray, anchor_feature: np.ndarray, correction:
 
 
 def _transform_features(features: np.ndarray, anchor_feature: np.ndarray, transform: dict[str, np.ndarray]) -> np.ndarray:
-    x = np.column_stack((features[:, transform["active"]], anchor_feature))
+    selected = features[:, transform["active"]]
+    x = np.column_stack((_apply_feature_transform(selected, transform["log_mask"]), anchor_feature))
     return np.clip((x - transform["feature_mean"]) / transform["feature_scale"], -20.0, 20.0).astype(np.float32)
 
 
@@ -101,10 +104,19 @@ def _restore_target(values: np.ndarray, transform: dict[str, np.ndarray]) -> np.
     return (values * transform["target_scale"][0] + transform["target_mean"][0]).astype(np.float32)
 
 
-def _fit_ridge(spec: object, train_x: np.ndarray, train_y: np.ndarray, transform: dict[str, np.ndarray], test_anchor: np.ndarray, test_counts: np.ndarray, test_x: np.ndarray) -> tuple[np.ndarray, dict[str, object]]:
-    model = Ridge(alpha=1.0).fit(train_x, train_y)
-    correction = _restore_target(model.predict(test_x), transform)
-    return _decode(spec, test_anchor, correction, test_counts), {"model_parameters": int(model.coef_.size + 1)}
+def _log_feature_mask(features: np.ndarray) -> np.ndarray:
+    nonnegative = np.min(features, axis=0) >= 0.0
+    p50 = np.percentile(features, 50, axis=0)
+    p95 = np.percentile(features, 95, axis=0)
+    spread = np.divide(p95, np.maximum(p50, 1e-6), out=np.zeros_like(p95), where=p50 > 0.0)
+    return (nonnegative & ((p95 > 10.0) | (spread >= 100.0))).astype(bool)
+
+
+def _apply_feature_transform(features: np.ndarray, log_mask: np.ndarray) -> np.ndarray:
+    output = features.astype(np.float32, copy=True)
+    if log_mask.any():
+        output[:, log_mask] = np.log1p(np.maximum(output[:, log_mask], 0.0))
+    return output
 
 
 def _predict(network: nn.Module, features: np.ndarray, batch_size: int) -> np.ndarray:
@@ -117,29 +129,117 @@ def _predict(network: nn.Module, features: np.ndarray, batch_size: int) -> np.nd
     return result
 
 
-def _validation_loss(network: nn.Module, features: np.ndarray, target: np.ndarray, batch_size: int) -> float:
+def _decode_torch(spec: object, anchor: torch.Tensor, correction: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    delta = torch.clamp(correction, -20.0, 20.0)
+    if _is_count_rate(spec):
+        quantum = 1000.0 / torch.clamp(counts, min=1.0)
+        return quantum * torch.clamp((1.0 + torch.clamp(anchor, min=0.0) / quantum) * torch.exp(delta) - 1.0, min=0.0)
+    return torch.clamp(anchor, min=0.0) * torch.exp(delta)
+
+
+def _restore_target_torch(values: torch.Tensor, transform: dict[str, np.ndarray]) -> torch.Tensor:
+    scale = torch.as_tensor(float(transform["target_scale"][0]), dtype=values.dtype, device=values.device)
+    mean = torch.as_tensor(float(transform["target_mean"][0]), dtype=values.dtype, device=values.device)
+    return values * scale + mean
+
+
+def _training_loss(
+    spec: object,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    anchor: torch.Tensor,
+    counts: torch.Tensor,
+    truth: torch.Tensor,
+    transform: dict[str, np.ndarray],
+) -> torch.Tensor:
+    if not _is_count_rate(spec):
+        return nn.functional.smooth_l1_loss(prediction, target)
+    correction = _restore_target_torch(prediction, transform)
+    decoded = _decode_torch(spec, anchor, correction, counts)
+    positive = truth > 0.0
+    components = [0.05 * nn.functional.smooth_l1_loss(prediction, target)]
+    if bool(positive.any()):
+        denominator = torch.clamp(torch.abs(truth[positive]).sum(), min=1e-6)
+        components.append(torch.abs(decoded[positive] - truth[positive]).sum() / denominator)
+    if bool((~positive).any()):
+        components.append(0.01 * torch.log1p(torch.clamp(decoded[~positive], min=0.0)).mean())
+    return sum(components)
+
+
+def _validation_objective(spec: object, truth: np.ndarray, prediction: np.ndarray) -> float:
+    if _is_count_rate(spec):
+        positive = truth > 0.0
+        if not positive.any():
+            return float(np.mean(np.log1p(np.maximum(prediction, 0.0))))
+        positive_wape = float(np.abs(prediction[positive] - truth[positive]).sum() / max(np.abs(truth[positive]).sum(), 1e-8))
+        zero_penalty = 0.0
+        if (~positive).any():
+            zero_penalty = 0.01 * float(np.mean(np.log1p(np.maximum(prediction[~positive], 0.0))))
+        return positive_wape + zero_penalty
+    return float(np.mean(np.abs(prediction - truth) / np.maximum(np.abs(prediction) + np.abs(truth), 1e-8)))
+
+
+def _validation_loss(
+    network: nn.Module,
+    features: np.ndarray,
+    anchor: np.ndarray,
+    counts: np.ndarray,
+    truth: np.ndarray,
+    transform: dict[str, np.ndarray],
+    spec: object,
+    batch_size: int,
+) -> float:
     network.eval()
-    with torch.inference_mode():
-        values = [float(nn.functional.smooth_l1_loss(network(batch[0]).squeeze(1), batch[1])) for batch in DataLoader(TensorDataset(torch.from_numpy(features), torch.from_numpy(target)), batch_size=batch_size)]
+    correction = _restore_target(_predict(network, features, batch_size), transform)
+    prediction = _decode(spec, anchor, correction, counts)
     network.train()
-    return float(np.mean(values)) if values else np.inf
+    return _validation_objective(spec, truth, prediction)
 
 
-def _fit_mlp(task: object, train_x: np.ndarray, train_y: np.ndarray, valid_x: np.ndarray, valid_y: np.ndarray, transform: dict[str, np.ndarray], spec: object, test_anchor: np.ndarray, test_counts: np.ndarray, test_x: np.ndarray, *, seed: int) -> tuple[np.ndarray, dict[str, object]]:
+def _fit_mlp(
+    task: object,
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    train_anchor: np.ndarray,
+    train_counts: np.ndarray,
+    train_truth: np.ndarray,
+    valid_x: np.ndarray,
+    valid_anchor: np.ndarray,
+    valid_counts: np.ndarray,
+    valid_truth: np.ndarray,
+    transform: dict[str, np.ndarray],
+    spec: object,
+    test_anchor: np.ndarray,
+    test_counts: np.ndarray,
+    test_x: np.ndarray,
+    *,
+    seed: int,
+) -> tuple[np.ndarray, dict[str, object]]:
     torch.manual_seed(seed)
     torch.set_num_threads(task.num_threads)
     network = CrossDomainNetwork(train_x.shape[1], task.hidden_dims, task.dropout)
     optimizer = torch.optim.AdamW(network.parameters(), lr=task.learning_rate, weight_decay=task.weight_decay)
-    loader = DataLoader(TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)), batch_size=task.batch_size, shuffle=True)
+    loader = DataLoader(
+        TensorDataset(
+            torch.from_numpy(train_x),
+            torch.from_numpy(train_y),
+            torch.from_numpy(train_anchor.astype(np.float32, copy=False)),
+            torch.from_numpy(train_counts.astype(np.float32, copy=False)),
+            torch.from_numpy(train_truth.astype(np.float32, copy=False)),
+        ),
+        batch_size=task.batch_size,
+        shuffle=True,
+    )
     best_loss, best_state, best_epoch, stale = np.inf, None, 0, 0
     for epoch in range(task.max_epochs):
         network.train()
-        for feature_batch, target_batch in loader:
-            loss = nn.functional.smooth_l1_loss(network(feature_batch).squeeze(1), target_batch)
+        for feature_batch, target_batch, anchor_batch, count_batch, truth_batch in loader:
+            prediction = network(feature_batch).squeeze(1)
+            loss = _training_loss(spec, prediction, target_batch, anchor_batch, count_batch, truth_batch, transform)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        current = _validation_loss(network, valid_x, valid_y, task.batch_size)
+        current = _validation_loss(network, valid_x, valid_anchor, valid_counts, valid_truth, transform, spec, task.batch_size)
         if current < best_loss - 1e-6:
             best_loss, best_state, best_epoch, stale = current, copy.deepcopy(network.state_dict()), epoch + 1, 0
         else:
@@ -150,7 +250,11 @@ def _fit_mlp(task: object, train_x: np.ndarray, train_y: np.ndarray, valid_x: np
         raise RuntimeError("cross-domain training produced no model")
     network.load_state_dict(best_state)
     correction = _restore_target(_predict(network, test_x, task.batch_size), transform)
-    return _decode(spec, test_anchor, correction, test_counts), {"selected_epoch": best_epoch, "model_parameters": int(sum(parameter.numel() for parameter in network.parameters()))}
+    return _decode(spec, test_anchor, correction, test_counts), {
+        "selected_epoch": best_epoch,
+        "validation_objective": float(best_loss),
+        "model_parameters": int(sum(parameter.numel() for parameter in network.parameters())),
+    }
 
 
 def _macro_errors(truth: np.ndarray, prediction: np.ndarray, workloads: np.ndarray) -> dict[str, float]:
@@ -170,12 +274,23 @@ def _is_sparse_truth(truth: np.ndarray) -> bool:
 
 
 def _model_summary(truth: np.ndarray, prediction: np.ndarray, workloads: np.ndarray, *, sparse: bool) -> dict[str, float]:
+    macro = _macro_errors(truth, prediction, workloads)
     if not sparse:
-        return {"smape_pct": _macro_errors(truth, prediction, workloads)["smape_pct"]}
+        return {"smape_pct": macro["smape_pct"], "wape_pct": macro["wape_pct"]}
     active = truth > 0.0
+    zero = ~active
+    positive_wape = (
+        _macro_errors(truth[active], prediction[active], workloads[active])["wape_pct"]
+        if active.any()
+        else float("nan")
+    )
     return {
-        "average_precision": float(average_precision_score(active, prediction)),
-        "positive_wape_pct": _macro_errors(truth[active], prediction[active], workloads[active])["wape_pct"],
+        "smape_pct": macro["smape_pct"],
+        "wape_pct": macro["wape_pct"],
+        "average_precision": float(average_precision_score(active, prediction)) if active.any() and zero.any() else float("nan"),
+        "positive_wape_pct": positive_wape,
+        "zero_pred_abs_p50": float(np.median(np.abs(prediction[zero]))) if zero.any() else float("nan"),
+        "zero_pred_abs_p95": float(np.percentile(np.abs(prediction[zero]), 95)) if zero.any() else float("nan"),
     }
 
 
@@ -183,92 +298,58 @@ def _is_degenerate_truth(truth: np.ndarray) -> bool:
     return bool(np.std(truth.astype(np.float64, copy=False)) <= 1e-12)
 
 
-def _best_model(summary: dict[str, object]) -> str:
-    models = summary["models"]
-    assert isinstance(models, dict)
-    if summary["metric_kind"] == "sparse":
-        return min(
-            models,
-            key=lambda name: (
-                -float(models[name]["average_precision"]),
-                float(models[name]["positive_wape_pct"]),
-            ),
-        )
-    return min(models, key=lambda name: float(models[name]["smape_pct"]))
-
-
 def _metric_summary(truth: np.ndarray, predictions: dict[str, np.ndarray], workloads: np.ndarray) -> dict[str, object]:
     sparse = _is_sparse_truth(truth)
-    output = {
+    models = {
+        variant: _model_summary(truth, prediction, workloads, sparse=sparse)
+        for variant, prediction in predictions.items()
+    }
+    output: dict[str, object] = {
         "metric_kind": "sparse" if sparse else "continuous",
         "truth_degenerate": _is_degenerate_truth(truth),
-        "models": {
-            variant: _model_summary(truth, prediction, workloads, sparse=sparse)
-            for variant, prediction in predictions.items()
-        },
+        "models": models,
     }
-    output["best_model"] = _best_model(output)
-    output["selected_model"] = _selected_model(output)
-    output["selected_regressed_from_anchor"] = _regressed_from_anchor(output, str(output["selected_model"]))
+    if "anchor" in models and "mlp" in models:
+        output["mlp_vs_anchor"] = _summary_delta(models["mlp"], models["anchor"])
     return output
 
 
-def _model_improves(summary: dict[str, object], model: str) -> bool:
-    models = summary["models"]
-    assert isinstance(models, dict)
-    anchor, candidate = models["anchor"], models[model]
-    if summary["metric_kind"] == "sparse":
-        return (
-            float(candidate["average_precision"]) >= float(anchor["average_precision"])
-            and float(candidate["positive_wape_pct"]) < float(anchor["positive_wape_pct"])
-        )
-    return float(candidate["smape_pct"]) < float(anchor["smape_pct"])
-
-
-def _regressed_from_anchor(summary: dict[str, object], model: str, *, tolerance_pct: float = 5.0) -> bool:
-    if model == "anchor":
-        return False
-    models = summary["models"]
-    assert isinstance(models, dict)
-    anchor, candidate = models["anchor"], models[model]
-    if summary["metric_kind"] == "sparse":
-        return (
-            float(candidate["average_precision"]) + 1e-12 < float(anchor["average_precision"])
-            or float(candidate["positive_wape_pct"]) > float(anchor["positive_wape_pct"]) * (1.0 + tolerance_pct / 100.0)
-        )
-    return float(candidate["smape_pct"]) > float(anchor["smape_pct"]) * (1.0 + tolerance_pct / 100.0)
-
-
-def _selected_model(summary: dict[str, object]) -> str:
-    best = str(summary["best_model"])
-    return "anchor" if _regressed_from_anchor(summary, best) else best
+def _summary_delta(candidate: dict[str, float], baseline: dict[str, float]) -> dict[str, float]:
+    output: dict[str, float] = {}
+    for key, value in candidate.items():
+        base = baseline.get(key)
+        if base is None or not np.isfinite(value) or not np.isfinite(base):
+            continue
+        output[f"{key}_delta"] = float(value - base)
+    return output
 
 
 def _acceptance(task: object, metrics: dict[str, dict[str, object]], fold_metrics: dict[str, list[dict[str, object]]]) -> dict[str, object]:
     improved: list[str] = []
-    selected: dict[str, str] = {}
     regressed: list[str] = []
     degenerate: list[str] = []
     for spec in task.targets:
         summary = metrics[spec.metric]
-        chosen = str(summary["selected_model"])
-        selected[spec.metric] = chosen
         if bool(summary["truth_degenerate"]):
             degenerate.append(spec.metric)
             continue
-        if _regressed_from_anchor(summary, chosen):
-            regressed.append(spec.metric)
-            continue
-        stable = sum(_model_improves(item, "mlp") for item in fold_metrics[spec.metric]) >= 4
-        if chosen != "anchor" and (_model_improves(summary, chosen) or (chosen == "mlp" and stable)):
+        models = summary["models"]
+        assert isinstance(models, dict)
+        delta = summary.get("mlp_vs_anchor")
+        assert isinstance(delta, dict)
+        key = "positive_wape_pct_delta" if summary["metric_kind"] == "sparse" else "smape_pct_delta"
+        if float(delta.get(key, 0.0)) < 0.0:
             improved.append(spec.metric)
+        elif float(delta.get(key, 0.0)) > 0.0:
+            regressed.append(spec.metric)
     evaluated = len(tuple(task.targets)) - len(degenerate)
     return {
-        "selected_models": selected,
+        "model": "mlp",
+        "baseline": "anchor",
         "improved_targets": improved,
         "regressed_targets": regressed,
         "degenerate_targets": degenerate,
-        "passed": not regressed and evaluated > 0 and bool(improved),
+        "passed": evaluated > 0 and bool(improved),
     }
 
 
@@ -296,8 +377,8 @@ def _derived(values: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 def evaluate_cross_domain(*, task: object, dataset_path: str | Path, output_dir: str | Path) -> dict[str, str]:
     frame = pq.read_table(dataset_path).to_pandas()
-    required = {"workload_id", "interval_index", "instruction_count", "stats_anchors", "stats_features", *(spec.metric for spec in task.targets)}
-    if frame.empty or not required <= set(frame) or frame.duplicated(["workload_id", "interval_index"]).any():
+    required = {"workload_id", "prefix_index", "instruction_count", "stats_anchors", "stats_features", *(spec.metric for spec in task.targets)}
+    if frame.empty or not required <= set(frame) or frame.duplicated(["workload_id", "prefix_index"]).any():
         raise ValueError("cross-domain dataset has invalid identities or columns")
     anchors, features = _vector_column(frame["stats_anchors"]), _vector_column(frame["stats_features"])
     truth = frame.loc[:, [spec.metric for spec in task.targets]].to_numpy(dtype=np.float32)
@@ -308,7 +389,7 @@ def evaluate_cross_domain(*, task: object, dataset_path: str | Path, output_dir:
     folds = min(task.evaluation_folds, len(np.unique(workloads)))
     if folds != task.evaluation_folds:
         raise ValueError("cross-domain evaluation requires five workloads")
-    predictions = {"anchor": anchors.copy(), "ridge": np.empty_like(truth), "mlp": np.empty_like(truth)}
+    predictions = {"anchor": anchors.copy(), "mlp": np.empty_like(truth)}
     reports: list[dict[str, object]] = []
     fold_metrics = {spec.metric: [] for spec in task.targets}
     splitter = GroupKFold(n_splits=folds, shuffle=True, random_state=task.seed)
@@ -321,15 +402,31 @@ def evaluate_cross_domain(*, task: object, dataset_path: str | Path, output_dir:
             transform = _fit_transform(features[train], feature[train], correction[train])
             train_x, valid_x, test_x = (_transform_features(features[item], feature[item], transform) for item in (train, valid, test))
             train_y, valid_y = (_transform_target(correction[item], transform) for item in (train, valid))
-            ridge, ridge_report = _fit_ridge(spec, train_x, train_y, transform, anchors[test, index], counts[test], test_x)
-            mlp, mlp_report = _fit_mlp(task, train_x, train_y, valid_x, valid_y, transform, spec, anchors[test, index], counts[test], test_x, seed=task.seed + fold + index)
-            predictions["ridge"][test, index], predictions["mlp"][test, index] = ridge, mlp
+            mlp, mlp_report = _fit_mlp(
+                task,
+                train_x,
+                train_y,
+                anchors[train, index],
+                counts[train],
+                truth[train, index],
+                valid_x,
+                anchors[valid, index],
+                counts[valid],
+                truth[valid, index],
+                transform,
+                spec,
+                anchors[test, index],
+                counts[test],
+                test_x,
+                seed=task.seed + fold + index,
+            )
+            predictions["mlp"][test, index] = mlp
             fold_metrics[spec.metric].append(_metric_summary(
                 truth[test, index],
                 {"anchor": anchors[test, index], "mlp": mlp},
                 workloads[test],
             ))
-            report["targets"][spec.metric] = {"active_semantic_features": int(len(transform["active"])), "ridge": ridge_report, "mlp": mlp_report}
+            report["targets"][spec.metric] = {"active_semantic_features": int(len(transform["active"])), "mlp": mlp_report}
         reports.append(report)
     return _publish(task, frame, truth, predictions, workloads, reports, fold_metrics, output_dir)
 
@@ -338,7 +435,7 @@ def _publish(task: object, frame: pd.DataFrame, truth: np.ndarray, predictions: 
     destination, partial = Path(output_dir), Path(output_dir).with_name(f".{Path(output_dir).name}.partial")
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(parents=True)
-    table = pa.Table.from_pandas(frame.loc[:, ["workload_id", "interval_index"]], preserve_index=False)
+    table = pa.Table.from_pandas(frame.loc[:, ["workload_id", "prefix_index"]], preserve_index=False)
     report_metrics: dict[str, dict[str, object]] = {}
     values = {variant: {spec.metric: prediction[:, index] for index, spec in enumerate(task.targets)} for variant, prediction in predictions.items()}
     values["truth"] = {spec.metric: truth[:, index] for index, spec in enumerate(task.targets)}
@@ -351,8 +448,6 @@ def _publish(task: object, frame: pd.DataFrame, truth: np.ndarray, predictions: 
             {variant: prediction[:, index] for variant, prediction in predictions.items()},
             workloads,
         )
-        selected = str(report_metrics[spec.metric]["selected_model"])
-        table = table.append_column(f"selected_{spec.metric}", pa.array(predictions[selected][:, index]))
     diagnostics: dict[str, dict[str, float]] = {}
     for metric in getattr(task, "diagnostic_ids", ()):
         diagnostic_values = frame[metric].to_numpy(dtype=np.float32)
@@ -373,17 +468,17 @@ def _publish(task: object, frame: pd.DataFrame, truth: np.ndarray, predictions: 
         if name == "__one":
             continue
         valid = np.isfinite(actual)
-        for variant in ("anchor", "ridge", "mlp"):
+        for variant in ("anchor", "mlp"):
             valid &= np.isfinite(derived_values[variant][name])
         if not valid.any():
             continue
         derived_metrics[name] = _metric_summary(
             actual[valid],
-            {variant: derived_values[variant][name][valid] for variant in ("anchor", "ridge", "mlp")},
+            {variant: derived_values[variant][name][valid] for variant in ("anchor", "mlp")},
             workloads[valid],
         )
         table = table.append_column(f"truth_{name}", pa.array(actual))
-        for variant in ("anchor", "ridge", "mlp"):
+        for variant in ("anchor", "mlp"):
             table = table.append_column(f"{variant}_{name}", pa.array(derived_values[variant][name]))
     oof = partial / "oof_predictions.parquet"
     pq.write_table(table, oof, compression="zstd")

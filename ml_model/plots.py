@@ -16,8 +16,8 @@ from matplotlib.lines import Line2D
 
 from .error_metrics import compute_regression_metrics
 
-_CROSS_DOMAIN_MODELS = ("anchor", "ridge", "mlp")
-_CROSS_DOMAIN_COLORS = {"anchor": "#4C78A8", "ridge": "#F58518", "mlp": "#54A24B"}
+_CROSS_DOMAIN_MODELS = ("anchor", "mlp")
+_CROSS_DOMAIN_COLORS = {"anchor": "#4C78A8", "mlp": "#54A24B"}
 
 def plot_surrogate_generalization_errors(
     *,
@@ -134,7 +134,7 @@ def _cross_domain_metrics(frame: pd.DataFrame, evaluation: dict[str, object]) ->
 
 
 def _validate_cross_domain_predictions(frame: pd.DataFrame, metrics: tuple[str, ...], path: Path) -> None:
-    required = ("workload_id", "interval_index")
+    required = ("workload_id", "prefix_index")
     missing = [column for column in required if column not in frame]
     if missing:
         raise ValueError(f"cross-domain OOF artifact is missing columns: {missing}")
@@ -186,11 +186,10 @@ def _plot_cross_domain_metric(
     _plot_truth_density(density_axis, truth)
     _plot_relative_residuals(residual_axis, truth, predictions)
 
-    selected = metric_report.get("selected_model", "n/a")
     kind = metric_report.get("metric_kind", "n/a")
     degenerate = metric_report.get("truth_degenerate", False)
     figure.suptitle(
-        f"{metric}: PMU sample distribution and model residuals | selected={selected} | kind={kind} | degenerate={degenerate}",
+        f"{metric}: PMU sample distribution and residuals | anchor baseline vs MLP | kind={kind} | degenerate={degenerate}",
         fontsize=11,
     )
     figure.text(
